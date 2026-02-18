@@ -148,14 +148,18 @@ func _build_ui() -> void:
 
 # ── Viewport wrapper ──────────────────────────────────────────────────────────
 func _build_viewport_wrapper() -> Control:
-	var wrapper := Control.new()
-	wrapper.name         = "ViewportWrapper"
+	# Use a MarginContainer instead of bare Control so children fill it
+	var wrapper := MarginContainer.new()
+	wrapper.name = "ViewportWrapper"
+	wrapper.add_theme_constant_override("margin_left",   0)
+	wrapper.add_theme_constant_override("margin_right",  0)
+	wrapper.add_theme_constant_override("margin_top",    0)
+	wrapper.add_theme_constant_override("margin_bottom", 0)
 	wrapper.clip_contents = true
 
 	_vp_container = SubViewportContainer.new()
 	_vp_container.name    = "SVPContainer"
 	_vp_container.stretch = true
-	_vp_container.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_vp_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_vp_container.size_flags_vertical   = Control.SIZE_EXPAND_FILL
 	_vp_container.add_child(editor_3d.get_sub_viewport())
@@ -323,10 +327,11 @@ func _build_top_bar() -> Control:
 	for ti in E3.Tool.values():
 		var ti_val : int = ti
 		var btn := Button.new()
-		btn.text         = TOOL_ICONS[ti] + " " + TOOL_NAMES[ti]
+		btn.text         = TOOL_ICONS[ti]          # ← icon only, no long name
 		btn.toggle_mode  = true
 		btn.button_group = bg
 		btn.tooltip_text = TOOL_NAMES[ti] + "  [touche %d]" % (ti + 1)
+		btn.custom_minimum_size = Vector2(36, 0)    # ← compact width
 		btn.pressed.connect(func(): _select_tool(ti_val))
 		if ti == E3.Tool.SHARED_CORNER: btn.button_pressed = true
 		hbox.add_child(btn)

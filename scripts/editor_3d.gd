@@ -91,6 +91,7 @@ func _ready() -> void:
 
 func _build_viewport() -> void:
 	_sub_viewport = SubViewport.new()
+	_sub_viewport.world_3d = World3D.new() 
 	_sub_viewport.size = Vector2i(1200, 800)
 	_sub_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
 	_sub_viewport.physics_object_picking      = true
