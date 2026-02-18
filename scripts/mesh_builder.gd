@@ -1,11 +1,12 @@
 ## mesh_builder.gd
 ## Builds ArrayMesh for a single CubeData.
 ## Each face is a separate surface → one material per face.
-## top face corners can have independent Y → smooth terrain effect possible.
+## FIX : AtlasTexture ne fonctionne pas correctement en 3D (Godot 4).
+##       On utilise la texture complète + uv1_offset / uv1_scale pour isoler la cellule.
 class_name MeshBuilder
 extends RefCounted
 
-## Material cache: "path|col|row|cs" → StandardMaterial3D
+## Material cache: "path|col|row|cs|uvs" → StandardMaterial3D
 static var _mat_cache     : Dictionary = {}
 static var _default_top   : StandardMaterial3D = null
 static var _default_side  : StandardMaterial3D = null
@@ -19,7 +20,6 @@ static func clear_cache() -> void:
 
 ## Build an ArrayMesh for a CubeData.
 ## cube_size = TILE_SIZE for full tiles, TILE_SIZE/2 for sub-tiles.
-## The MeshInstance3D should be positioned so Y=0 = cube base.
 static func build_cube(
 	cube     : MapData.CubeData,
 	cube_size: float,
@@ -40,20 +40,18 @@ static func build_cube(
 	var bse := Vector3( hx, by,  hz)
 	var bsw := Vector3(-hx, by,  hz)
 
-	# Each face: [v0, v1, v2, v3,  normal,  face_idx]
-	# Winding CCW from outside (Godot default front-face)
 	var face_quads := [
-		# TOP — CCW from above (Y+)
+		# TOP
 		[tnw, tne, tse, tsw,  Vector3(0, 1, 0),   MapData.FACE_TOP],
-		# NORTH Z- — CCW from Z-
+		# NORTH Z-
 		[tne, tnw, bnw, bne,  Vector3(0, 0,-1),   MapData.FACE_NORTH],
-		# SOUTH Z+ — CCW from Z+
+		# SOUTH Z+
 		[tsw, tse, bse, bsw,  Vector3(0, 0, 1),   MapData.FACE_SOUTH],
-		# WEST X- — CCW from X-
+		# WEST X-
 		[tnw, tsw, bsw, bnw,  Vector3(-1, 0, 0),  MapData.FACE_WEST],
-		# EAST X+ — CCW from X+
+		# EAST X+
 		[tse, tne, bne, bse,  Vector3( 1, 0, 0),  MapData.FACE_EAST],
-		# BOTTOM — CCW from below (Y-)
+		# BOTTOM
 		[bnw, bne, bse, bsw,  Vector3(0,-1, 0),   MapData.FACE_BOTTOM],
 	]
 
@@ -63,7 +61,6 @@ static func build_cube(
 		var v2 : Vector3 = fq[2]; var v3 : Vector3 = fq[3]
 		var n  : Vector3 = fq[4]; var fi  : int     = fq[5]
 		var fc : MapData.FaceConfig = cube.face_configs[fi]
-		var uv := _face_uvs(fc)
 
 		# Smooth normals on top face if corners differ
 		var n0 := n; var n1 := n; var n2 := n; var n3 := n
@@ -74,10 +71,12 @@ static func build_cube(
 			n3 = _smooth_n(v3, v0, v2)
 
 		var arr := []; arr.resize(Mesh.ARRAY_MAX)
-		arr[Mesh.ARRAY_VERTEX]  = PackedVector3Array([v0, v1, v2, v3])
-		arr[Mesh.ARRAY_NORMAL]  = PackedVector3Array([n0, n1, n2, n3])
-		arr[Mesh.ARRAY_TEX_UV]  = uv
-		arr[Mesh.ARRAY_INDEX]   = PackedInt32Array([0, 1, 2,  0, 2, 3])
+		arr[Mesh.ARRAY_VERTEX] = PackedVector3Array([v0, v1, v2, v3])
+		arr[Mesh.ARRAY_NORMAL] = PackedVector3Array([n0, n1, n2, n3])
+		# UVs toujours 0→1 ; c'est uv1_offset/uv1_scale du matériau qui isole la cellule
+		arr[Mesh.ARRAY_TEX_UV] = PackedVector2Array([
+			Vector2(0,0), Vector2(1,0), Vector2(1,1), Vector2(0,1)])
+		arr[Mesh.ARRAY_INDEX]  = PackedInt32Array([0, 1, 2,  0, 2, 3])
 		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
 		mesh.surface_set_material(fi, _get_mat(fc, fi == MapData.FACE_TOP))
 
@@ -91,31 +90,47 @@ static func _smooth_n(v: Vector3, a: Vector3, b: Vector3) -> Vector3:
 	var n := (a - v).cross(b - v).normalized()
 	return n if n.y >= 0.0 else -n
 
-static func _face_uvs(fc: MapData.FaceConfig) -> PackedVector2Array:
-	var s := fc.uv_scale
-	return PackedVector2Array([Vector2(0,0), Vector2(s,0), Vector2(s,s), Vector2(0,s)])
-
+# ── Matériau ──────────────────────────────────────────────────────────────────
+# On NE PAS utiliser AtlasTexture en 3D : Godot 4 ne remaphe pas les UV UV→région.
+# À la place : texture complète + uv1_offset/uv1_scale calculés depuis la cellule.
+#
+#   uv1_offset = (col * cell_size / tex_w ,  row * cell_size / tex_h)
+#   uv1_scale  = (cell_size / tex_w * uv_scale ,  cell_size / tex_h * uv_scale)
+#
+# Avec des UVs mesh de 0 à 1 :
+#   UV final = UV_mesh * uv1_scale + uv1_offset
+#   → à UV=0 : début de la cellule  ✓
+#   → à UV=1 : fin de la cellule (×uv_scale pour la répétition)  ✓
 static func _get_mat(fc: MapData.FaceConfig, is_top: bool) -> StandardMaterial3D:
 	if fc.has_texture():
-		var key := "%s|%d|%d|%d" % [fc.atlas_path, fc.atlas_col, fc.atlas_row, fc.cell_size]
+		var key := "%s|%d|%d|%d|%.3f" % [
+			fc.atlas_path, fc.atlas_col, fc.atlas_row, fc.cell_size, fc.uv_scale]
 		if _mat_cache.has(key):
 			return _mat_cache[key]
-		var atlas_img = load(fc.atlas_path)
-		if atlas_img != null:
-			var atlas_tex := AtlasTexture.new()
-			atlas_tex.atlas  = atlas_img
-			atlas_tex.region = Rect2(
-				fc.atlas_col * fc.cell_size,
-				fc.atlas_row * fc.cell_size,
-				fc.cell_size, fc.cell_size)
+
+		var atlas_tex := load(fc.atlas_path) as Texture2D
+		if atlas_tex != null:
+			var tw  := float(atlas_tex.get_width())
+			var th  := float(atlas_tex.get_height())
+			var cs  := float(fc.cell_size)
+
+			# Offset = coin haut-gauche de la cellule en coordonnées 0-1
+			var u_off := (float(fc.atlas_col) * cs) / tw
+			var v_off := (float(fc.atlas_row) * cs) / th
+			# Scale = taille d'une cellule en coordonnées 0-1, multipliée par uv_scale
+			var u_scl := (cs / tw) * fc.uv_scale
+			var v_scl := (cs / th) * fc.uv_scale
+
 			var mat := StandardMaterial3D.new()
-			mat.albedo_texture   = atlas_tex
-			mat.texture_filter   = BaseMaterial3D.TEXTURE_FILTER_NEAREST
-			mat.uv1_scale        = Vector3(fc.uv_scale, fc.uv_scale, 1.0)
-			mat.cull_mode        = BaseMaterial3D.CULL_DISABLED
-			mat.roughness        = 0.9
-			_mat_cache[key] = mat
+			mat.albedo_texture = atlas_tex
+			mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+			mat.uv1_offset     = Vector3(u_off, v_off, 0.0)
+			mat.uv1_scale      = Vector3(u_scl, v_scl, 1.0)
+			mat.cull_mode      = BaseMaterial3D.CULL_DISABLED
+			mat.roughness      = 0.9
+			_mat_cache[key]    = mat
 			return mat
+
 	return _default_mat(is_top)
 
 static func _default_mat(is_top: bool) -> StandardMaterial3D:
@@ -134,7 +149,6 @@ static func _default_mat(is_top: bool) -> StandardMaterial3D:
 			_default_side.cull_mode    = BaseMaterial3D.CULL_DISABLED
 		return _default_side
 
-## Returns a semi-transparent hover overlay material.
 static func hover_material() -> StandardMaterial3D:
 	if _hover_mat == null:
 		_hover_mat = StandardMaterial3D.new()
@@ -144,7 +158,6 @@ static func hover_material() -> StandardMaterial3D:
 		_hover_mat.no_depth_test = false
 	return _hover_mat
 
-## Returns a selection highlight material.
 static func selection_material() -> StandardMaterial3D:
 	if _sel_mat == null:
 		_sel_mat = StandardMaterial3D.new()
@@ -153,7 +166,6 @@ static func selection_material() -> StandardMaterial3D:
 		_sel_mat.cull_mode     = BaseMaterial3D.CULL_DISABLED
 	return _sel_mat
 
-## Build a small sphere mesh for corner indicators.
 static func build_sphere(radius: float, color: Color) -> Mesh:
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = color
@@ -161,8 +173,4 @@ static func build_sphere(radius: float, color: Color) -> Mesh:
 	var sm := SphereMesh.new()
 	sm.radius = radius; sm.height = radius * 2.0
 	sm.radial_segments = 8; sm.rings = 4
-	# SphereMesh returns a PrimitiveMesh, not ArrayMesh — wrap it
-	var mi := MeshInstance3D.new()
-	mi.mesh = sm; mi.set_surface_override_material(0, mat)
-	# Return mesh for direct use (caller adds MeshInstance3D themselves)
 	return sm
