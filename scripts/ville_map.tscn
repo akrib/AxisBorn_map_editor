@@ -1,0 +1,109 @@
+[gd_scene load_steps=3 format=3 uid="uid://ville_map"]
+
+[ext_resource type="Script" path="res://maps/ville_map.gd" id="1"]
+[ext_resource type="PackedScene" uid="uid://npc_scene" path="res://scenes/npc.tscn" id="2"]
+
+[node name="VilleMap" type="Node2D"]
+script = ExtResource("1")
+metadata/_edit_horizontal_guides_ = []
+
+[node name="Background" type="ColorRect" parent="."]
+offset_left = -2000.0
+offset_top = -2000.0
+offset_right = 2000.0
+offset_bottom = 2000.0
+color = Color(0.3, 0.35, 0.45, 1)
+
+[node name="MapLabel" type="Label" parent="."]
+offset_left = -380.0
+offset_top = -280.0
+offset_right = 380.0
+offset_bottom = -240.0
+theme_override_font_sizes/font_size = 32
+text = "🏘️ VILLE - ZONE DE DÉPART"
+horizontal_alignment = 1
+
+[node name="Buildings" type="Node2D" parent="."]
+
+[node name="Building1" type="ColorRect" parent="Buildings"]
+offset_left = -300.0
+offset_top = -150.0
+offset_right = -150.0
+offset_bottom = 50.0
+color = Color(0.6, 0.5, 0.4, 1)
+
+[node name="Building2" type="ColorRect" parent="Buildings"]
+offset_left = 150.0
+offset_top = -150.0
+offset_right = 300.0
+offset_bottom = 50.0
+color = Color(0.6, 0.5, 0.4, 1)
+
+[node name="Building3" type="ColorRect" parent="Buildings"]
+offset_left = -300.0
+offset_top = 100.0
+offset_right = -150.0
+offset_bottom = 300.0
+color = Color(0.6, 0.5, 0.4, 1)
+
+[node name="Building4" type="ColorRect" parent="Buildings"]
+offset_left = 150.0
+offset_top = 100.0
+offset_right = 300.0
+offset_bottom = 300.0
+color = Color(0.6, 0.5, 0.4, 1)
+
+[node name="CentralPlaza" type="ColorRect" parent="."]
+offset_left = -100.0
+offset_top = -50.0
+offset_right = 100.0
+offset_bottom = 150.0
+color = Color(0.5, 0.5, 0.5, 0.3)
+
+[node name="NPCs" type="Node2D" parent="."]
+
+[node name="Portals" type="Node2D" parent="."]
+
+[node name="PortalForest" type="Area2D" parent="Portals"]
+position = Vector2(0, 350)
+collision_layer = 8
+collision_mask = 1
+script = ExtResource("portal_script")
+metadata/destination_map = "forest"
+
+[node name="PortalVisual" type="Node2D" parent="Portals/PortalForest"]
+
+[node name="OuterCircle" type="ColorRect" parent="Portals/PortalForest/PortalVisual"]
+offset_left = -60.0
+offset_top = -60.0
+offset_right = 60.0
+offset_bottom = 60.0
+color = Color(0.2, 0.8, 0.3, 0.6)
+
+[node name="MiddleCircle" type="ColorRect" parent="Portals/PortalForest/PortalVisual"]
+offset_left = -45.0
+offset_top = -45.0
+offset_right = 45.0
+offset_bottom = 45.0
+color = Color(0.3, 0.9, 0.4, 0.7)
+
+[node name="InnerCircle" type="ColorRect" parent="Portals/PortalForest/PortalVisual"]
+offset_left = -30.0
+offset_top = -30.0
+offset_right = 30.0
+offset_bottom = 30.0
+color = Color(0.4, 1.0, 0.5, 0.8)
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="Portals/PortalForest"]
+shape = SubResource("CircleShape2D_portal")
+
+[node name="Label" type="Label" parent="Portals/PortalForest"]
+offset_left = -50.0
+offset_top = -90.0
+offset_right = 50.0
+offset_bottom = -70.0
+text = "🌲 FORÊT"
+horizontal_alignment = 1
+
+[sub_resource type="CircleShape2D" id="CircleShape2D_portal"]
+radius = 50.0

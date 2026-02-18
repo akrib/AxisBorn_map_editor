@@ -11,17 +11,18 @@ const MB := preload("res://scripts/mesh_builder.gd")
 # ══════════════════════════════════════════════════════════════════════════════
 signal cube_hovered(tx: int, ty: int, si: int)
 signal cube_clicked(tx: int, ty: int, si: int, face_idx: int)
-signal corner_hovered(corners: Array)   ## Array of {tx,ty,si,ci}
+signal corner_hovered(corners: Array)
 signal selection_changed
+signal status_message(msg: String)   ## NEW: pour afficher des messages dans l'UI
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TOOL ENUM
 # ══════════════════════════════════════════════════════════════════════════════
 enum Tool {
-	SHARED_CORNER,   ## raises/lowers the 4 shared corners at a grid intersection
-	FACE_HEIGHT,     ## selects face(s) and raises/lowers their top edge
-	TEXTURE,         ## applies current texture to clicked face
-	SINGLE_CORNER,   ## raises/lowers one corner of one cube
+	SHARED_CORNER,
+	FACE_HEIGHT,
+	TEXTURE,
+	SINGLE_CORNER,
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -29,10 +30,9 @@ enum Tool {
 # ══════════════════════════════════════════════════════════════════════════════
 var map_data       : MD
 var current_tool   : int = Tool.SHARED_CORNER
-var selected_faces = []
-var selected_corners = []
+var selected_faces   : Array = []
+var selected_corners : Array = []
 
-## Current texture to apply (set by SideBar)
 var pending_texture : MD.FaceConfig = null
 
 # 3D nodes
@@ -42,22 +42,29 @@ var _cam_rig       : Node3D
 var _map_root      : Node3D
 var _cube_root     : Node3D
 var _sel_root      : Node3D
+var _grid_root     : Node3D   ## NEW: grille de repère
 
 ## cube_key → {"mi": MeshInstance3D, "body": StaticBody3D}
 var _cube_nodes: Dictionary = {}
 
 ## Camera orbit state
 var _cam_distance  : float = 12.0
-var _cam_elevation : float = 40.0   ## degrees
-var _cam_azimuth   : float = 45.0   ## degrees
+var _cam_elevation : float = 40.0
+var _cam_azimuth   : float = 45.0
 var _cam_pan       : Vector2 = Vector2.ZERO
 var _is_orbiting   : bool = false
 var _is_panning    : bool = false
 var _last_mouse    : Vector2 = Vector2.ZERO
 
+## FIX: flag pour s'assurer que la physique est prête
+var _physics_ready : bool = false
+
 ## Hover indicators
-var _hover_corner_spheres : Array = []  ## Array[MeshInstance3D]
+var _hover_corner_spheres : Array = []
 var _hover_face_plane     : MeshInstance3D = null
+
+## NEW: Tile highlight overlay (cube entier surligné)
+var _hover_tile_outline : MeshInstance3D = null
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INIT
@@ -67,33 +74,40 @@ func _init(md: MD) -> void:
 
 func _ready() -> void:
 	_build_viewport()
-	await get_tree().process_frame   # ✔ attendre d’être dans l’arbre
+	## FIX: attendre 2 frames pour que la physique soit prête
+	await get_tree().process_frame
+	await get_tree().process_frame
+	_physics_ready = true
 	_update_camera()
 
 func _build_viewport() -> void:
 	_sub_viewport = SubViewport.new()
-	_sub_viewport.size = Vector2i(1, 1)  ## resized by container
+	_sub_viewport.size = Vector2i(1, 1)
 	_sub_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
 	_sub_viewport.physics_object_picking  = true
-	# Ne pas l’ajouter ici !
-	# Il sera ajouté par EditorUI
-	#add_child(_sub_viewport)
 
 	# Environment
 	var env := WorldEnvironment.new()
 	var e := Environment.new()
 	e.background_mode       = Environment.BG_COLOR
-	e.background_color      = Color(0.15, 0.15, 0.18)
-	e.ambient_light_color   = Color(0.5, 0.5, 0.5)
-	e.ambient_light_energy  = 0.6
+	e.background_color      = Color(0.12, 0.12, 0.15)
+	e.ambient_light_color   = Color(0.6, 0.6, 0.65)
+	e.ambient_light_energy  = 0.7
 	env.environment = e
 	_sub_viewport.add_child(env)
 
 	# Light
 	var sun := DirectionalLight3D.new()
 	sun.rotation_degrees = Vector3(-50, 30, 0)
-	sun.light_energy     = 1.2
+	sun.light_energy     = 1.3
 	_sub_viewport.add_child(sun)
+
+	## NEW: lumière de remplissage douce (évite les zones trop sombres)
+	var fill := DirectionalLight3D.new()
+	fill.rotation_degrees = Vector3(-20, -150, 0)
+	fill.light_energy     = 0.4
+	fill.shadow_enabled   = false
+	_sub_viewport.add_child(fill)
 
 	# Camera rig
 	_cam_rig = Node3D.new()
@@ -107,9 +121,11 @@ func _build_viewport() -> void:
 	_map_root  = Node3D.new(); _map_root.name  = "MapRoot"
 	_cube_root = Node3D.new(); _cube_root.name = "Cubes"
 	_sel_root  = Node3D.new(); _sel_root.name  = "Selection"
+	_grid_root = Node3D.new(); _grid_root.name = "Grid"   ## NEW
 	_sub_viewport.add_child(_map_root)
 	_map_root.add_child(_cube_root)
 	_map_root.add_child(_sel_root)
+	_map_root.add_child(_grid_root)
 
 
 ## Called by EditorUI once the map is initialized.
@@ -118,6 +134,7 @@ func build_all() -> void:
 	for tx in map_data.grid_width:
 		for ty in map_data.grid_height:
 			_rebuild_tile(tx, ty)
+	_build_grid_overlay()   ## NEW
 	_center_camera_on_map()
 
 func _clear_cube_nodes() -> void:
@@ -129,12 +146,51 @@ func _clear_cube_nodes() -> void:
 	_clear_selection_nodes()
 
 # ══════════════════════════════════════════════════════════════════════════════
+# NEW: GRILLE DE REPÈRE
+# ══════════════════════════════════════════════════════════════════════════════
+func _build_grid_overlay() -> void:
+	for ch in _grid_root.get_children(): ch.queue_free()
+
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.5, 0.5, 0.5, 0.4)
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.cull_mode    = BaseMaterial3D.CULL_DISABLED
+	mat.no_depth_test = false
+
+	var TS := MD.TILE_SIZE
+	var W  := map_data.grid_width
+	var H  := map_data.grid_height
+
+	## Lignes X
+	for ix in (W + 1):
+		var x := float(ix) * TS - TS * 0.5
+		_add_grid_line(Vector3(x, 0.01, -TS * 0.5),
+					   Vector3(x, 0.01, float(H) * TS - TS * 0.5), mat)
+
+	## Lignes Z
+	for iz in (H + 1):
+		var z := float(iz) * TS - TS * 0.5
+		_add_grid_line(Vector3(-TS * 0.5, 0.01, z),
+					   Vector3(float(W) * TS - TS * 0.5, 0.01, z), mat)
+
+func _add_grid_line(a: Vector3, b: Vector3, mat: Material) -> void:
+	var arr := []; arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = PackedVector3Array([a, b])
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_LINES, arr)
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	mi.set_surface_override_material(0, mat)
+	_grid_root.add_child(mi)
+
+func toggle_grid(visible: bool) -> void:
+	_grid_root.visible = visible
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TILE / CUBE BUILDING
 # ══════════════════════════════════════════════════════════════════════════════
-
-## Rebuild all cubes for one tile (full or subdivided).
 func _rebuild_tile(tx: int, ty: int) -> void:
-	# Remove old nodes for this tile
 	for si in [-1, 0, 1, 2, 3]:
 		var key := _cube_key(tx, ty, si)
 		if _cube_nodes.has(key):
@@ -166,8 +222,11 @@ func _spawn_cube(tx: int, ty: int, si: int, cube: MD.CubeData, cube_size: float)
 	var shape  := BoxShape3D.new()
 	var top_h  := cube.top_max()
 	var by     := cube.base_y
-	shape.size = Vector3(cube_size, top_h - by, cube_size)
-	cshape.position = Vector3(0, by + (top_h - by) * 0.5, 0)
+
+	## FIX: taille minimum pour éviter les collisions dégénérées
+	var height := maxf(top_h - by, 0.1)
+	shape.size = Vector3(cube_size * 0.98, height, cube_size * 0.98)
+	cshape.position = Vector3(0, by + height * 0.5, 0)
 	cshape.shape = shape
 	body.add_child(cshape)
 	mi.add_child(body)
@@ -196,14 +255,14 @@ func rebuild_cube(tx: int, ty: int, si: int) -> void:
 	if _cube_nodes.has(key):
 		var mi : MeshInstance3D = _cube_nodes[key]["mi"]
 		mi.mesh = MB.build_cube(cube, cube_size)
-		# Update collision shape too
 		var body : StaticBody3D = _cube_nodes[key]["body"]
 		for ch in body.get_children(): ch.queue_free()
 		var cshape := CollisionShape3D.new()
 		var shape  := BoxShape3D.new()
 		var top_h := cube.top_max(); var by := cube.base_y
-		shape.size = Vector3(cube_size, top_h - by, cube_size)
-		cshape.position = Vector3(0, by + (top_h - by) * 0.5, 0)
+		var height := maxf(top_h - by, 0.1)
+		shape.size = Vector3(cube_size * 0.98, height, cube_size * 0.98)
+		cshape.position = Vector3(0, by + height * 0.5, 0)
 		cshape.shape = shape
 		body.add_child(cshape)
 	else:
@@ -216,10 +275,13 @@ func _center_camera_on_map() -> void:
 	var cx := (map_data.grid_width  - 1) * MD.TILE_SIZE * 0.5
 	var cz := (map_data.grid_height - 1) * MD.TILE_SIZE * 0.5
 	_cam_rig.position = Vector3(cx, 0.0, cz)
-	_cam_distance  = maxf(8.0, maxf(map_data.grid_width, map_data.grid_height) * 1.2)
+	_cam_distance  = maxf(8.0, maxf(map_data.grid_width, map_data.grid_height) * 1.5)
+	_cam_elevation = 45.0
+	_cam_azimuth   = 45.0
 	_update_camera()
 
 func _update_camera() -> void:
+	if _camera == null: return
 	var az_rad := deg_to_rad(_cam_azimuth)
 	var el_rad := deg_to_rad(_cam_elevation)
 	var d      := _cam_distance
@@ -239,28 +301,35 @@ func handle_viewport_input(event: InputEvent) -> void:
 		_on_mouse_motion(event)
 
 func _on_mouse_button(event: InputEventMouseButton) -> void:
-	if event.button_index == MOUSE_BUTTON_MIDDLE:
+	## FIX: clic DROIT = orbiter (plus intuitif que le clic milieu)
+	## Clic MILIEU = aussi orbiter (rétro-compatible)
+	if event.button_index == MOUSE_BUTTON_RIGHT or event.button_index == MOUSE_BUTTON_MIDDLE:
 		if event.pressed:
-			if event.shift_pressed:
+			if event.shift_pressed or event.button_index == MOUSE_BUTTON_MIDDLE and event.shift_pressed:
+				_is_panning = true
+			elif event.alt_pressed and event.button_index == MOUSE_BUTTON_RIGHT:
 				_is_panning = true
 			else:
 				_is_orbiting = true
 			_last_mouse = event.position
 		else:
-			_is_orbiting = false; _is_panning = false
+			_is_orbiting = false
+			_is_panning  = false
 
 	elif event.button_index == MOUSE_BUTTON_WHEEL_UP:
-		_cam_distance = maxf(2.0, _cam_distance - 1.0); _update_camera()
+		_cam_distance = maxf(2.0, _cam_distance * 0.9); _update_camera()
 	elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-		_cam_distance = minf(60.0, _cam_distance + 1.0); _update_camera()
+		_cam_distance = minf(80.0, _cam_distance * 1.1); _update_camera()
 
 	elif event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
-		_do_tool_click(event.position)
+		## FIX: ne pas faire le pick si on est en orbite/pan
+		if not _is_orbiting and not _is_panning:
+			_do_tool_click(event.position)
 
 func _on_mouse_motion(event: InputEventMouseMotion) -> void:
 	if _is_orbiting:
-		_cam_azimuth  += event.relative.x * 0.4
-		_cam_elevation = clampf(_cam_elevation - event.relative.y * 0.3, 5.0, 89.0)
+		_cam_azimuth  += event.relative.x * 0.5
+		_cam_elevation = clampf(_cam_elevation - event.relative.y * 0.4, 5.0, 89.0)
 		_update_camera()
 	elif _is_panning:
 		var right := _camera.global_transform.basis.x
@@ -270,20 +339,23 @@ func _on_mouse_motion(event: InputEventMouseMotion) -> void:
 	else:
 		_do_tool_hover(event.position)
 
+## NEW: reset de la caméra vers la position centrée
+func reset_camera() -> void:
+	_center_camera_on_map()
+
 # ══════════════════════════════════════════════════════════════════════════════
 # RAYCAST
 # ══════════════════════════════════════════════════════════════════════════════
 func _raycast(mouse_pos: Vector2) -> Dictionary:
-	if _camera == null:
-		return {}
+	## FIX: vérifier que tout est prêt
+	if not _physics_ready: return {}
+	if _camera == null:    return {}
 
 	var world := _sub_viewport.get_world_3d()
-	if world == null:
-		return {}   # viewport pas encore prêt
+	if world == null: return {}
 
 	var space := world.get_direct_space_state()
-	if space == null:
-		return {}
+	if space == null: return {}
 
 	var from := _camera.project_ray_origin(mouse_pos)
 	var dir  := _camera.project_ray_normal(mouse_pos)
@@ -298,16 +370,20 @@ func _hit_to_cube_info(hit: Dictionary) -> Dictionary:
 	if hit.is_empty(): return {}
 	var collider = hit.get("collider")
 	if collider == null: return {}
+	## FIX: la StaticBody3D peut être directement le collider
+	## On cherche le MeshInstance3D parent
 	var mi = collider.get_parent()
+	if not (mi is MeshInstance3D):
+		mi = collider  ## fallback
 	if not (mi is MeshInstance3D): return {}
 	if not mi.has_meta("tx"): return {}
 	return {
-		"tx"      : mi.get_meta("tx"),
-		"ty"      : mi.get_meta("ty"),
-		"si"      : mi.get_meta("si"),
-		"pos"     : hit.get("position", Vector3.ZERO),
-		"normal"  : hit.get("normal",   Vector3.UP),
-		"mi"      : mi,
+		"tx"     : mi.get_meta("tx"),
+		"ty"     : mi.get_meta("ty"),
+		"si"     : mi.get_meta("si"),
+		"pos"    : hit.get("position", Vector3.ZERO),
+		"normal" : hit.get("normal",   Vector3.UP),
+		"mi"     : mi,
 	}
 
 func _hit_face_idx(normal: Vector3) -> int:
@@ -320,7 +396,6 @@ func _hit_face_idx(normal: Vector3) -> int:
 		return MD.FACE_EAST if normal.x > 0 else MD.FACE_WEST
 	return MD.FACE_SOUTH if normal.z > 0 else MD.FACE_NORTH
 
-## Returns the nearest corner of a cube to a 3D hit position.
 func _nearest_corner(tx: int, ty: int, si: int, hit_pos: Vector3) -> int:
 	var best_ci := 0; var best_d := INF
 	for ci in 4:
@@ -332,12 +407,8 @@ func _nearest_corner(tx: int, ty: int, si: int, hit_pos: Vector3) -> int:
 		if d < best_d: best_d = d; best_ci = ci
 	return best_ci
 
-## Finds the nearest corner GRID INTERSECTION (shared by up to 4 cubes)
-## to a hit position. Returns world XZ as Vector2.
 func _nearest_grid_corner_xz(hit_pos: Vector3) -> Vector2:
 	var TS := MD.TILE_SIZE
-	# Grid corners are at multiples of TS/2 for full tiles.
-	# We snap to nearest multiple of TS/2.
 	var snx := roundf(hit_pos.x / (TS * 0.5)) * (TS * 0.5)
 	var snz := roundf(hit_pos.z / (TS * 0.5)) * (TS * 0.5)
 	return Vector2(snx, snz)
@@ -346,6 +417,7 @@ func _nearest_grid_corner_xz(hit_pos: Vector3) -> Vector2:
 # TOOL HOVER
 # ══════════════════════════════════════════════════════════════════════════════
 func _do_tool_hover(mouse_pos: Vector2) -> void:
+	if not _physics_ready: return
 	var hit  := _raycast(mouse_pos)
 	var info := _hit_to_cube_info(hit)
 	_clear_hover_visuals()
@@ -354,7 +426,11 @@ func _do_tool_hover(mouse_pos: Vector2) -> void:
 	var tx: int = info["tx"]
 	var ty: int = info["ty"]
 	var si: int = info["si"]
-	var hit_pos : Vector3 = info["pos"]; var normal : Vector3 = info["normal"]
+	var hit_pos : Vector3 = info["pos"]
+	var normal  : Vector3 = info["normal"]
+
+	## NEW: toujours afficher le contour de la tuile survolée
+	_show_tile_outline(tx, ty, si)
 
 	match current_tool:
 		Tool.SHARED_CORNER:
@@ -379,18 +455,65 @@ func _do_tool_hover(mouse_pos: Vector2) -> void:
 			_show_face_highlight(tx, ty, si, fi, MB.hover_material())
 			cube_hovered.emit(tx, ty, si)
 
+## NEW: contour filaire de la tuile survolée
+func _show_tile_outline(tx: int, ty: int, si: int) -> void:
+	var cube := map_data.get_cube(tx, ty, si)
+	if cube == null: return
+	var td := map_data.get_tile(tx, ty)
+	var cs := MD.TILE_SIZE if (not td.subdivided) else MD.TILE_SIZE * 0.5
+	var pos := _cube_world_pos(tx, ty, si, cs)
+
+	var hx := cs * 0.5 + 0.03
+	var hz := hx
+	var yt := cube.top_max() + 0.03
+	var yb := cube.base_y   - 0.01
+
+	## 8 arêtes du dessus + 4 verticales
+	var lines := PackedVector3Array([
+		## Top face
+		Vector3(-hx, yt, -hz), Vector3( hx, yt, -hz),
+		Vector3( hx, yt, -hz), Vector3( hx, yt,  hz),
+		Vector3( hx, yt,  hz), Vector3(-hx, yt,  hz),
+		Vector3(-hx, yt,  hz), Vector3(-hx, yt, -hz),
+		## Verticals
+		Vector3(-hx, yb, -hz), Vector3(-hx, yt, -hz),
+		Vector3( hx, yb, -hz), Vector3( hx, yt, -hz),
+		Vector3( hx, yb,  hz), Vector3( hx, yt,  hz),
+		Vector3(-hx, yb,  hz), Vector3(-hx, yt,  hz),
+	])
+
+	var arr := []; arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = lines
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_LINES, arr)
+
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color  = Color(1.0, 0.85, 0.1, 1.0)
+	mat.shading_mode  = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.cull_mode     = BaseMaterial3D.CULL_DISABLED
+	mat.no_depth_test = false
+
+	var mi := MeshInstance3D.new()
+	mi.position = pos
+	mi.mesh = mesh
+	mi.set_surface_override_material(0, mat)
+	_sel_root.add_child(mi)
+	_hover_tile_outline = mi
+
 func _show_corner_spheres(corners: Array) -> void:
 	for cr in corners:
 		var p := map_data.get_corner_world_xz(cr["tx"], cr["ty"], cr["si"], cr["ci"])
 		var cube := map_data.get_cube(cr["tx"], cr["ty"], cr["si"])
-		var y    := cube.corners[cr["ci"]] + 0.04 if cube else 0.5
+		var y    := cube.corners[cr["ci"]] + 0.06 if cube else 0.5
 		var mi   := MeshInstance3D.new()
 		mi.position = Vector3(p.x, y, p.y)
 		var mat  := StandardMaterial3D.new()
-		mat.albedo_color = Color(1, 0.9, 0, 1)
-		mat.cull_mode    = BaseMaterial3D.CULL_DISABLED
+		mat.albedo_color  = Color(1, 0.9, 0, 1)
+		mat.shading_mode  = BaseMaterial3D.SHADING_MODE_UNSHADED
+		mat.cull_mode     = BaseMaterial3D.CULL_DISABLED
 		mi.mesh = SphereMesh.new()
-		(mi.mesh as SphereMesh).radius = 0.07; (mi.mesh as SphereMesh).height = 0.14
+		(mi.mesh as SphereMesh).radius = 0.10
+		(mi.mesh as SphereMesh).height = 0.20
 		mi.set_surface_override_material(0, mat)
 		_sel_root.add_child(mi)
 		_hover_corner_spheres.append(mi)
@@ -400,34 +523,49 @@ func _show_face_highlight(tx: int, ty: int, si: int, fi: int, mat: Material) -> 
 	if cube == null: return
 	var td := map_data.get_tile(tx, ty)
 	var cs := MD.TILE_SIZE if (not td.subdivided) else MD.TILE_SIZE * 0.5
-	var hi_mesh := MB.build_cube(cube, cs * 1.01)  ## slightly larger
+	var hi_mesh := MB.build_cube(cube, cs * 1.01)
 	var mi := MeshInstance3D.new()
 	mi.position = _cube_world_pos(tx, ty, si, cs)
 	mi.mesh = hi_mesh
+	## FIX: n'afficher que la face concernée, les autres en transparent invisible
+	var invis := StandardMaterial3D.new()
+	invis.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	invis.albedo_color = Color(0, 0, 0, 0)
 	for s in 6:
-		mi.set_surface_override_material(s, null)
+		mi.set_surface_override_material(s, invis)
 	mi.set_surface_override_material(fi, mat)
 	_sel_root.add_child(mi)
 	_hover_face_plane = mi
 
 func _clear_hover_visuals() -> void:
-	for s in _hover_corner_spheres: if is_instance_valid(s): s.queue_free()
+	for s in _hover_corner_spheres:
+		if is_instance_valid(s): s.queue_free()
 	_hover_corner_spheres.clear()
 	if _hover_face_plane != null and is_instance_valid(_hover_face_plane):
 		_hover_face_plane.queue_free()
 		_hover_face_plane = null
+	if _hover_tile_outline != null and is_instance_valid(_hover_tile_outline):
+		_hover_tile_outline.queue_free()
+		_hover_tile_outline = null
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TOOL CLICK
 # ══════════════════════════════════════════════════════════════════════════════
 func _do_tool_click(mouse_pos: Vector2) -> void:
+	if not _physics_ready:
+		status_message.emit("Initialisation en cours, veuillez patienter...")
+		return
 	var hit  := _raycast(mouse_pos)
 	var info := _hit_to_cube_info(hit)
-	if info.is_empty(): return
+	if info.is_empty():
+		## FIX: clic dans le vide = désélectionner
+		clear_selection()
+		return
 	var tx: int = info["tx"]
 	var ty: int = info["ty"]
 	var si: int = info["si"]
-	var hit_pos : Vector3 = info["pos"]; var normal : Vector3 = info["normal"]
+	var hit_pos : Vector3 = info["pos"]
+	var normal  : Vector3 = info["normal"]
 
 	match current_tool:
 		Tool.SHARED_CORNER:
@@ -437,6 +575,7 @@ func _do_tool_click(mouse_pos: Vector2) -> void:
 			selected_faces.clear()
 			_refresh_selection_overlay()
 			selection_changed.emit()
+			status_message.emit("Coins sélectionnés : %d" % shared.size())
 
 		Tool.SINGLE_CORNER:
 			var ci := _nearest_corner(tx, ty, si, hit_pos)
@@ -444,21 +583,21 @@ func _do_tool_click(mouse_pos: Vector2) -> void:
 			selected_faces.clear()
 			_refresh_selection_overlay()
 			selection_changed.emit()
+			status_message.emit("Coin (%d,%d) sélectionné" % [tx, ty])
 
 		Tool.FACE_HEIGHT:
 			var fi := _hit_face_idx(normal)
-			var ref := {"tx":tx,"ty":ty,"si":si,"face_idx":fi}
-			# Toggle in selection
 			var found := false
 			for i in selected_faces.size():
 				var sf: Dictionary = selected_faces[i]
 				if sf["tx"]==tx and sf["ty"]==ty and sf["si"]==si and sf["face_idx"]==fi:
 					selected_faces.remove_at(i); found = true; break
-			if not found: selected_faces.append(ref)
+			if not found: selected_faces.append({"tx":tx,"ty":ty,"si":si,"face_idx":fi})
 			selected_corners.clear()
 			_refresh_selection_overlay()
 			selection_changed.emit()
 			cube_clicked.emit(tx, ty, si, fi)
+			status_message.emit("Face sélectionnée sur tuile (%d,%d)" % [tx, ty])
 
 		Tool.TEXTURE:
 			var fi := _hit_face_idx(normal)
@@ -467,6 +606,9 @@ func _do_tool_click(mouse_pos: Vector2) -> void:
 				if cube:
 					cube.face_configs[fi] = pending_texture.dup()
 					rebuild_cube(tx, ty, si)
+					status_message.emit("Texture appliquée sur (%d,%d)" % [tx, ty])
+			else:
+				status_message.emit("Sélectionnez d'abord une texture dans la barre latérale")
 			cube_clicked.emit(tx, ty, si, fi)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -477,6 +619,8 @@ func adjust_height(delta: float) -> void:
 		_adjust_corner_heights(delta)
 	elif not selected_faces.is_empty():
 		_adjust_face_heights(delta)
+	else:
+		status_message.emit("Sélectionnez d'abord un coin ou une face")
 
 func _adjust_corner_heights(delta: float) -> void:
 	for cr in selected_corners:
@@ -498,14 +642,12 @@ func _adjust_face_heights(delta: float) -> void:
 	_rebuild_affected_tiles_from_faces()
 	_refresh_selection_overlay()
 
-
 func _rebuild_affected_tiles_from_corners() -> void:
 	var done := {}
 	for cr in selected_corners:
 		var k := "%d,%d" % [cr["tx"], cr["ty"]]
 		if not done.has(k):
-			done[k] = true
-			_rebuild_tile(cr["tx"], cr["ty"])
+			done[k] = true; _rebuild_tile(cr["tx"], cr["ty"])
 
 func _rebuild_affected_tiles_from_faces() -> void:
 	var done := {}
@@ -513,9 +655,7 @@ func _rebuild_affected_tiles_from_faces() -> void:
 		var sf := sf_any as Dictionary
 		var k := "%d,%d" % [sf["tx"], sf["ty"]]
 		if not done.has(k):
-			done[k] = true
-			_rebuild_tile(sf["tx"], sf["ty"])
-
+			done[k] = true; _rebuild_tile(sf["tx"], sf["ty"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SELECTION OVERLAY
@@ -523,43 +663,46 @@ func _rebuild_affected_tiles_from_faces() -> void:
 func _clear_selection_nodes() -> void:
 	for ch in _sel_root.get_children(): ch.queue_free()
 	_hover_corner_spheres.clear()
-	_hover_face_plane = null
+	_hover_face_plane   = null
+	_hover_tile_outline = null
 
 func _refresh_selection_overlay() -> void:
 	_clear_selection_nodes()
 	var sel_mat := MB.selection_material()
 
-	# Draw selected corners as blue spheres
 	for cr in selected_corners:
 		var p  := map_data.get_corner_world_xz(cr["tx"], cr["ty"], cr["si"], cr["ci"])
 		var cube := map_data.get_cube(cr["tx"], cr["ty"], cr["si"])
-		var y  := (cube.corners[cr["ci"]] + 0.05) if cube else 0.5
+		var y  := (cube.corners[cr["ci"]] + 0.06) if cube else 0.5
 		var mi := MeshInstance3D.new()
 		mi.position = Vector3(p.x, y, p.y)
 		var mat := StandardMaterial3D.new()
-		mat.albedo_color = Color(0.1, 0.6, 1.0)
-		mat.cull_mode    = BaseMaterial3D.CULL_DISABLED
+		mat.albedo_color  = Color(0.1, 0.6, 1.0)
+		mat.shading_mode  = BaseMaterial3D.SHADING_MODE_UNSHADED
+		mat.cull_mode     = BaseMaterial3D.CULL_DISABLED
 		mi.mesh = SphereMesh.new()
-		(mi.mesh as SphereMesh).radius = 0.09; (mi.mesh as SphereMesh).height = 0.18
+		(mi.mesh as SphereMesh).radius = 0.12
+		(mi.mesh as SphereMesh).height = 0.24
 		mi.set_surface_override_material(0, mat)
 		_sel_root.add_child(mi)
 
-	# Draw selected faces
 	for sf in selected_faces:
 		var td := map_data.get_tile(sf["tx"], sf["ty"])
 		if td == null: continue
 		var cs := MD.TILE_SIZE if not td.subdivided else MD.TILE_SIZE * 0.5
 		var cube := map_data.get_cube(sf["tx"], sf["ty"], sf["si"])
 		if cube == null: continue
-		var hi_mesh := MB.build_cube(cube, cs * 1.01)
+		var hi_mesh := MB.build_cube(cube, cs * 1.015)
 		var mi      := MeshInstance3D.new()
 		mi.position = _cube_world_pos(sf["tx"], sf["ty"], sf["si"], cs)
 		mi.mesh     = hi_mesh
-		for s in 6: mi.set_surface_override_material(s, null)
+		var invis := StandardMaterial3D.new()
+		invis.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		invis.albedo_color = Color(0, 0, 0, 0)
+		for s in 6: mi.set_surface_override_material(s, invis)
 		mi.set_surface_override_material(sf["face_idx"], sel_mat)
 		_sel_root.add_child(mi)
 
-## Clear current selection.
 func clear_selection() -> void:
 	selected_corners.clear(); selected_faces.clear()
 	_clear_selection_nodes(); selection_changed.emit()
@@ -582,13 +725,11 @@ func merge_tile(tx: int, ty: int) -> void:
 	clear_selection()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TEST MODE (TerrainModule3D view)
+# TEST MODE
 # ══════════════════════════════════════════════════════════════════════════════
 func toggle_test_mode(enabled: bool) -> void:
 	_cube_root.visible = not enabled
-	# In test mode we'd instantiate TerrainModule3D populated from map_data.
-	# For now just hide editor geometry to show what a clean export looks like.
-	# Full TerrainModule3D integration: call export_to_terrain_module().
+	_grid_root.visible = not enabled
 
 func export_to_json_map() -> Dictionary:
 	var jm : Dictionary = {
