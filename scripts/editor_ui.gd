@@ -1,7 +1,6 @@
-## editor_ui.gd  –  Version 2.0
-## UI complète : TopBar / Sidebar / Viewport 3D / BottomBar.
-## Nouveautés : Undo/Redo, pipette, snap, copier/coller, touches fléchées caméra,
-##              minimap, import/export heightmap.
+## editor_ui.gd  –  Version 2.2
+## Layout : TopBar / [SidebarG | Viewport | SidebarD(caméra)] / BottomBar
+## Fix sidebar droite : utilise MarginContainer + size_flags explicites.
 extends Control
 
 const MD := preload("res://scripts/map_data.gd")
@@ -26,10 +25,7 @@ var _atlas_cell_size     : int    = 32
 var _uv_scale_spin       : SpinBox = null
 var _texture_grid_container : GridContainer
 var _loaded_atlases : Array = []
-
-## Minimap
-var _minimap_rect  : TextureRect = null
-var _minimap_panel : PanelContainer = null
+var _minimap_rect   : TextureRect = null
 
 const TOOL_NAMES := [
 	"4 Coins partagés", "Hauteur de face", "Texture", "Coin unique", "Pipette"
@@ -51,17 +47,18 @@ func _ready() -> void:
 	editor_3d.texture_picked.connect(_on_texture_picked)
 	editor_3d.cube_hovered.connect(func(_a,_b,_c): pass)
 	_scan_texture_folder()
+	# ── FIX RAYCAST ──────────────────────────────────────────────────────────
+	editor_3d.set_viewport_container(_vp_container)
 
 func _on_status_message(msg: String) -> void:
 	_status_label.text = msg
 
-## Pipette : met à jour l'UI quand une texture est récupérée
 func _on_texture_picked(fc: MD.FaceConfig) -> void:
 	var lbl := _side_bar.get_node_or_null("SelTexLbl") as Label
 	if lbl:
 		lbl.text = "💧 " + fc.atlas_path.get_file() + "\n[col %d, row %d]" % [fc.atlas_col, fc.atlas_row]
 	if _uv_scale_spin: _uv_scale_spin.value = fc.uv_scale
-	_select_tool_by_idx(2)  ## bascule automatiquement en mode Texture
+	_select_tool_by_idx(2)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # RACCOURCIS CLAVIER
@@ -72,53 +69,29 @@ func _input(event: InputEvent) -> void:
 	if not event.pressed or event.echo: return
 
 	match event.keycode:
-		## Hauteur
-		KEY_EQUAL, KEY_KP_ADD:
-			editor_3d.adjust_height(MD.HEIGHT_STEP)
-		KEY_MINUS, KEY_KP_SUBTRACT:
-			editor_3d.adjust_height(-MD.HEIGHT_STEP)
-		KEY_PAGEUP:
-			editor_3d.adjust_height(1.0)
-		KEY_PAGEDOWN:
-			editor_3d.adjust_height(-1.0)
-
-		## Caméra — Touches fléchées
-		## Les flèches déplacent le pivot (pan) selon les axes monde X/Z
-		KEY_UP:
-			editor_3d.pan_camera(Vector3(0, 0, -1))
-		KEY_DOWN:
-			editor_3d.pan_camera(Vector3(0, 0,  1))
-		KEY_LEFT:
-			editor_3d.pan_camera(Vector3(-1, 0, 0))
-		KEY_RIGHT:
-			editor_3d.pan_camera(Vector3( 1, 0, 0))
-
-		## Outils 1-5
+		KEY_EQUAL, KEY_KP_ADD:    editor_3d.adjust_height( MD.HEIGHT_STEP)
+		KEY_MINUS, KEY_KP_SUBTRACT: editor_3d.adjust_height(-MD.HEIGHT_STEP)
+		KEY_PAGEUP:               editor_3d.adjust_height( 1.0)
+		KEY_PAGEDOWN:             editor_3d.adjust_height(-1.0)
+		KEY_UP:    editor_3d.pan_camera(Vector3( 0, 0,-1))
+		KEY_DOWN:  editor_3d.pan_camera(Vector3( 0, 0, 1))
+		KEY_LEFT:  editor_3d.pan_camera(Vector3(-1, 0, 0))
+		KEY_RIGHT: editor_3d.pan_camera(Vector3( 1, 0, 0))
 		KEY_1: _select_tool_by_idx(0)
 		KEY_2: _select_tool_by_idx(1)
 		KEY_3: _select_tool_by_idx(2)
 		KEY_4: _select_tool_by_idx(3)
 		KEY_5: _select_tool_by_idx(4)
-
-		## Undo / Redo
 		KEY_Z:
-			if event.ctrl_pressed and event.shift_pressed:
-				editor_3d.redo()
-			elif event.ctrl_pressed:
-				editor_3d.undo()
+			if event.ctrl_pressed and event.shift_pressed: editor_3d.redo()
+			elif event.ctrl_pressed:                       editor_3d.undo()
 		KEY_Y:
 			if event.ctrl_pressed: editor_3d.redo()
-
-		## Copier / Coller
 		KEY_C:
 			if event.ctrl_pressed: editor_3d.copy_selected()
 		KEY_V:
 			if event.ctrl_pressed: editor_3d.paste_selected()
-
-		## Caméra
-		KEY_F:    editor_3d.reset_camera()
-
-		## Déselect
+		KEY_F:      editor_3d.reset_camera()
 		KEY_ESCAPE: editor_3d.clear_selection()
 
 func _select_tool_by_idx(idx: int) -> void:
@@ -132,54 +105,199 @@ func _select_tool_by_idx(idx: int) -> void:
 func _build_ui() -> void:
 	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 
-	var vbox := VBoxContainer.new()
-	vbox.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	add_child(vbox)
+	var root_vbox := VBoxContainer.new()
+	root_vbox.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	add_child(root_vbox)
 
-	vbox.add_child(_build_top_bar())
+	# ── Barre du haut ─────────────────────────────────────────────────────────
+	root_vbox.add_child(_build_top_bar())
 
-	var content := HSplitContainer.new()
-	content.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	content.split_offset = 210
-	vbox.add_child(content)
+	# ── Zone centrale ─────────────────────────────────────────────────────────
+	var center_hbox := HBoxContainer.new()
+	center_hbox.size_flags_vertical   = Control.SIZE_EXPAND_FILL
+	center_hbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	center_hbox.add_theme_constant_override("separation", 0)
+	root_vbox.add_child(center_hbox)
 
+	# Sidebar gauche
 	_side_bar = _build_side_bar()
-	_side_bar.custom_minimum_size = Vector2(210, 0)
-	content.add_child(_side_bar)
+	_side_bar.custom_minimum_size     = Vector2(210, 0)
+	_side_bar.size_flags_horizontal   = Control.SIZE_SHRINK_BEGIN
+	_side_bar.size_flags_vertical     = Control.SIZE_EXPAND_FILL
+	center_hbox.add_child(_side_bar)
 
-	## Zone viewport + minimap superposée
+	# Zone viewport (prend tout l'espace restant)
 	var vp_wrapper := _build_viewport_wrapper()
-	content.add_child(vp_wrapper)
+	vp_wrapper.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vp_wrapper.size_flags_vertical   = Control.SIZE_EXPAND_FILL
+	center_hbox.add_child(vp_wrapper)
 
+	# Sidebar droite — caméra
+	var cam_panel := _build_right_camera_panel()
+	cam_panel.custom_minimum_size   = Vector2(148, 0)
+	cam_panel.size_flags_horizontal = Control.SIZE_SHRINK_END
+	cam_panel.size_flags_vertical   = Control.SIZE_EXPAND_FILL
+	center_hbox.add_child(cam_panel)
+
+	# ── Barre du bas ──────────────────────────────────────────────────────────
 	_bottom_bar = _build_bottom_bar()
-	vbox.add_child(_bottom_bar)
+	root_vbox.add_child(_bottom_bar)
 
 	_new_map_dialog = _build_new_map_dialog()
 	add_child(_new_map_dialog)
 
+# ── Viewport wrapper ──────────────────────────────────────────────────────────
 func _build_viewport_wrapper() -> Control:
-	## MarginContainer → overlay possible via Control enfant
 	var wrapper := Control.new()
-	wrapper.name = "ViewportWrapper"
-	wrapper.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	wrapper.size_flags_vertical   = Control.SIZE_EXPAND_FILL
+	wrapper.name         = "ViewportWrapper"
 	wrapper.clip_contents = true
 
 	_vp_container = SubViewportContainer.new()
-	_vp_container.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_vp_container.name    = "SVPContainer"
 	_vp_container.stretch = true
+	_vp_container.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_vp_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_vp_container.size_flags_vertical   = Control.SIZE_EXPAND_FILL
 	_vp_container.add_child(editor_3d.get_sub_viewport())
 	_vp_container.gui_input.connect(_on_viewport_input)
 	wrapper.add_child(_vp_container)
-
-	## Minimap — coin bas-droit de la zone viewport
-	_minimap_panel = _build_minimap()
-	wrapper.add_child(_minimap_panel)
 
 	return wrapper
 
 func _on_viewport_input(event: InputEvent) -> void:
 	editor_3d.handle_viewport_input(event)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PANNEAU DROIT — CAMÉRA
+# ══════════════════════════════════════════════════════════════════════════════
+func _build_right_camera_panel() -> PanelContainer:
+	var panel := PanelContainer.new()
+	panel.name = "CameraPanel"
+
+	var margin := MarginContainer.new()
+	for side in ["left","right","top","bottom"]:
+		margin.add_theme_constant_override("margin_" + side, 6)
+	panel.add_child(margin)
+
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 6)
+	margin.add_child(vbox)
+
+	# ── Titre ─────────────────────────────────────────────────────────────────
+	var title := Label.new()
+	title.text = "📷 Caméra"
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.add_theme_font_size_override("font_size", 14)
+	vbox.add_child(title)
+	vbox.add_child(HSeparator.new())
+
+	# ── Centrer ───────────────────────────────────────────────────────────────
+	var center_btn := Button.new()
+	center_btn.text = "🎯 Centrer [F]"
+	center_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	center_btn.pressed.connect(func(): editor_3d.reset_camera())
+	vbox.add_child(center_btn)
+	vbox.add_child(HSeparator.new())
+
+	# ── Élévation ─────────────────────────────────────────────────────────────
+	vbox.add_child(_cam_section_label("Élévation"))
+	var elev_row := HBoxContainer.new()
+	elev_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	elev_row.add_theme_constant_override("separation", 6)
+	var btn_up := Button.new(); btn_up.text = "▲ +10°"
+	btn_up.custom_minimum_size = Vector2(62, 30)
+	btn_up.tooltip_text = "Augmenter l'angle de vue"
+	btn_up.pressed.connect(func(): editor_3d.elevate_camera(10.0))
+	var btn_dn := Button.new(); btn_dn.text = "▼ -10°"
+	btn_dn.custom_minimum_size = Vector2(62, 30)
+	btn_dn.tooltip_text = "Réduire l'angle de vue"
+	btn_dn.pressed.connect(func(): editor_3d.elevate_camera(-10.0))
+	elev_row.add_child(btn_up); elev_row.add_child(btn_dn)
+	vbox.add_child(elev_row)
+	vbox.add_child(HSeparator.new())
+
+	# ── Zoom ──────────────────────────────────────────────────────────────────
+	vbox.add_child(_cam_section_label("Zoom"))
+	var zoom_row := HBoxContainer.new()
+	zoom_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	zoom_row.add_theme_constant_override("separation", 6)
+	var btn_zi := Button.new(); btn_zi.text = "🔍 +"
+	btn_zi.custom_minimum_size = Vector2(55, 30)
+	btn_zi.tooltip_text = "Zoom avant (molette haut)"
+	btn_zi.pressed.connect(func(): editor_3d.zoom_in())
+	var btn_zo := Button.new(); btn_zo.text = "🔍 −"
+	btn_zo.custom_minimum_size = Vector2(55, 30)
+	btn_zo.tooltip_text = "Zoom arrière (molette bas)"
+	btn_zo.pressed.connect(func(): editor_3d.zoom_out())
+	zoom_row.add_child(btn_zi); zoom_row.add_child(btn_zo)
+	vbox.add_child(zoom_row)
+	vbox.add_child(HSeparator.new())
+
+	# ── Rosace ────────────────────────────────────────────────────────────────
+	vbox.add_child(_cam_section_label("Vue depuis…"))
+	vbox.add_child(_build_compass_rose())
+	vbox.add_child(HSeparator.new())
+
+	# ── Grille ────────────────────────────────────────────────────────────────
+	var grid_chk := CheckButton.new()
+	grid_chk.text = "Grille"
+	grid_chk.button_pressed = true
+	grid_chk.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	grid_chk.toggled.connect(func(on): editor_3d.toggle_grid(on))
+	vbox.add_child(grid_chk)
+
+	# ── Mode test ─────────────────────────────────────────────────────────────
+	var test_chk := CheckButton.new()
+	test_chk.text = "Mode Test"
+	test_chk.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	test_chk.toggled.connect(func(on): editor_3d.toggle_test_mode(on))
+	vbox.add_child(test_chk)
+
+	# Spacer
+	var sp := Control.new()
+	sp.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vbox.add_child(sp)
+
+	return panel
+
+## Rosace 3×3 : N/NE/E/SE/S/SW/W/NW + Reset central
+func _build_compass_rose() -> GridContainer:
+	var grid := GridContainer.new()
+	grid.columns = 3
+	grid.add_theme_constant_override("h_separation", 3)
+	grid.add_theme_constant_override("v_separation", 3)
+
+	# [icône, azimut (-1=reset), tooltip]
+	var cells : Array = [
+		["↖", 315.0, "Nord-Ouest"], ["↑",  0.0, "Nord"],  ["↗",  45.0, "Nord-Est"],
+		["←", 270.0, "Ouest"],      ["⊙", -1.0, "Reset"], ["→",  90.0, "Est"],
+		["↙", 225.0, "Sud-Ouest"],  ["↓", 180.0, "Sud"],  ["↘", 135.0, "Sud-Est"],
+	]
+
+	for cell in cells:
+		var icon_s : String = cell[0]
+		var az_v   : float  = cell[1]
+		var tip    : String = cell[2]
+		var btn    := Button.new()
+		btn.text = icon_s
+		btn.custom_minimum_size = Vector2(40, 36)
+		btn.tooltip_text = tip
+		if az_v < 0.0:
+			btn.add_theme_color_override("font_color", Color(1.0, 0.85, 0.3))
+			btn.pressed.connect(func(): editor_3d.reset_camera())
+		else:
+			var az_cap := az_v
+			btn.pressed.connect(func(): editor_3d.look_from_azimuth(az_cap))
+		grid.add_child(btn)
+
+	return grid
+
+static func _cam_section_label(text: String) -> Label:
+	var l := Label.new()
+	l.text = text
+	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	l.add_theme_color_override("font_color", Color(0.6, 0.82, 1.0))
+	return l
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BARRE DU HAUT
@@ -191,18 +309,15 @@ func _build_top_bar() -> Control:
 	hbox.add_theme_constant_override("separation", 3)
 	bar.add_child(hbox)
 
-	## ── Fichier ──────────────────────────────────────────────────────────────
-	_add_btn(hbox, "📄 Nouveau",  func(): show_new_map_dialog(), Color(0.25,0.45,0.75))
-	_add_btn(hbox, "💾 Sauver",   func(): _save_map(),            Color(0.25,0.45,0.75))
-	_add_btn(hbox, "📂 Ouvrir",   func(): _load_map(),            Color(0.25,0.45,0.75))
+	_add_btn(hbox, "📄 Nouveau", func(): show_new_map_dialog(), Color(0.25,0.45,0.75))
+	_add_btn(hbox, "💾 Sauver",  func(): _save_map(),           Color(0.25,0.45,0.75))
+	_add_btn(hbox, "📂 Ouvrir",  func(): _load_map(),           Color(0.25,0.45,0.75))
 	_add_separator(hbox)
 
-	## ── Undo / Redo ──────────────────────────────────────────────────────────
-	_add_btn(hbox, "↶ Annuler",   func(): editor_3d.undo(), Color(0.30,0.30,0.45))
-	_add_btn(hbox, "↷ Rétablir",  func(): editor_3d.redo(), Color(0.30,0.30,0.45))
+	_add_btn(hbox, "↶ Annuler",  func(): editor_3d.undo(), Color(0.30,0.30,0.45))
+	_add_btn(hbox, "↷ Rétablir", func(): editor_3d.redo(), Color(0.30,0.30,0.45))
 	_add_separator(hbox)
 
-	## ── Outils ───────────────────────────────────────────────────────────────
 	_tool_buttons.clear()
 	var bg := ButtonGroup.new()
 	for ti in E3.Tool.values():
@@ -218,52 +333,30 @@ func _build_top_bar() -> Control:
 		_tool_buttons.append(btn)
 	_add_separator(hbox)
 
-	## ── Copier / Coller ──────────────────────────────────────────────────────
-	_add_btn(hbox, "📋 Copier [Ctrl+C]",  func(): editor_3d.copy_selected(),  Color(0.35,0.35,0.20))
-	_add_btn(hbox, "📌 Coller [Ctrl+V]",  func(): editor_3d.paste_selected(), Color(0.35,0.35,0.20))
+	_add_btn(hbox, "📋 Copier", func(): editor_3d.copy_selected(),  Color(0.35,0.35,0.20))
+	_add_btn(hbox, "📌 Coller", func(): editor_3d.paste_selected(), Color(0.35,0.35,0.20))
 	_add_separator(hbox)
 
-	## ── Subdivision ──────────────────────────────────────────────────────────
 	_add_btn(hbox, "⊞ Subdiviser", func(): _subdivide_selected(), Color(0.50,0.30,0.65))
 	_add_btn(hbox, "⊟ Fusionner",  func(): _merge_selected(),     Color(0.50,0.30,0.65))
 	_add_separator(hbox)
 
-	## ── Snap hauteur ─────────────────────────────────────────────────────────
 	var snap_btn := CheckButton.new()
-	snap_btn.text    = "Snap ↕"
+	snap_btn.text         = "Snap ↕"
 	snap_btn.tooltip_text = "Arrondir les hauteurs au pas (%.2f)" % MD.HEIGHT_STEP
 	snap_btn.toggled.connect(func(on): editor_3d.set_snap(on))
 	hbox.add_child(snap_btn)
 	_add_separator(hbox)
 
-	## ── Heightmap ────────────────────────────────────────────────────────────
 	_add_btn(hbox, "⬇ HMap", func(): _import_heightmap_dialog(), Color(0.30,0.40,0.30))
 	_add_btn(hbox, "⬆ HMap", func(): _export_heightmap_dialog(), Color(0.30,0.40,0.30))
 	_add_separator(hbox)
 
-	## ── Grille + Caméra ──────────────────────────────────────────────────────
-	var grid_btn := CheckButton.new()
-	grid_btn.text = "Grille"
-	grid_btn.button_pressed = true
-	grid_btn.toggled.connect(func(on): editor_3d.toggle_grid(on))
-	hbox.add_child(grid_btn)
-
-	_add_btn(hbox, "🎯 Centrer [F]", func(): editor_3d.reset_camera(), Color(0.3,0.4,0.3))
-
-	## ── Mode test ────────────────────────────────────────────────────────────
-	var test_btn := CheckButton.new()
-	test_btn.text = "Mode Test"
-	test_btn.toggled.connect(func(on): editor_3d.toggle_test_mode(on))
-	hbox.add_child(test_btn)
-
-	_add_separator(hbox)
-
-	## ── Label statut ─────────────────────────────────────────────────────────
 	_status_label = Label.new()
 	_status_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_status_label.horizontal_alignment  = HORIZONTAL_ALIGNMENT_RIGHT
 	_status_label.add_theme_color_override("font_color", Color(0.7, 0.7, 0.7))
-	_status_label.text = "Prêt  |  Clic gauche : sélectionner  |  Clic droit : orbiter  |  Molette : zoom  |  Flèches : paner"
+	_status_label.text = "Prêt  |  Clic gauche : sélectionner  |  Clic droit : orbiter  |  Molette : zoom"
 	hbox.add_child(_status_label)
 
 	return bar
@@ -271,7 +364,7 @@ func _build_top_bar() -> Control:
 func _select_tool(ti: int) -> void:
 	editor_3d.set_tool(ti)
 	var names := ["4 Coins partagés","Hauteur de face","Texture","Coin unique","Pipette 💧"]
-	_status_label.text = "Outil : " + names[ti] + "  |  1-5 : outils  |  F : centrer  |  +/- : hauteur  |  Flèches : paner caméra"
+	_status_label.text = "Outil : " + names[ti] + "  |  1-5 : outils  |  F : centrer  |  +/- : hauteur"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BARRE DU BAS
@@ -305,13 +398,11 @@ func _build_bottom_bar() -> Control:
 
 	var info := Label.new(); info.name = "SelInfo"
 	info.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	info.text = "Aucune sélection  |  Clic gauche : sélectionner  |  Flèches : déplacer la caméra"
+	info.text = "Aucune sélection  |  Clic gauche : sélectionner  |  Flèches : paner caméra"
 	info.add_theme_color_override("font_color", Color(0.8, 0.8, 0.8))
 	hbox.add_child(info)
 
 	return bar
-
-func _update_bottom_bar_for_tool(_ti: int) -> void: pass
 
 func _on_uv_scale_changed(v: float) -> void:
 	for sf in editor_3d.selected_faces:
@@ -338,7 +429,7 @@ func _on_selection_changed() -> void:
 	_update_minimap()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR — NAVIGATEUR DE TEXTURES + MINIMAP
+# SIDEBAR GAUCHE
 # ══════════════════════════════════════════════════════════════════════════════
 func _build_side_bar() -> Control:
 	var panel := PanelContainer.new()
@@ -383,7 +474,6 @@ func _build_side_bar() -> Control:
 
 	vbox.add_child(HSeparator.new())
 
-	## ── Minimap ──────────────────────────────────────────────────────────────
 	var mm_label := Label.new()
 	mm_label.text = "Minimap (hauteurs)"
 	mm_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -399,27 +489,11 @@ func _build_side_bar() -> Control:
 
 	return panel
 
-## ── Minimap overlay sur le viewport ─────────────────────────────────────────
-func _build_minimap() -> PanelContainer:
-	var panel := PanelContainer.new()
-	panel.name = "MinimapOverlay"
-	panel.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT)
-	panel.grow_horizontal = Control.GROW_DIRECTION_BEGIN
-	panel.grow_vertical   = Control.GROW_DIRECTION_BEGIN
-	panel.offset_right    = -6
-	panel.offset_bottom   = -6
-	panel.size            = Vector2(130, 130)
-	panel.modulate        = Color(1, 1, 1, 0.85)
-	panel.visible         = false   ## activé automatiquement à la création de la carte
-	return panel
-
 func _update_minimap() -> void:
 	if _minimap_rect == null or map_data == null: return
 	if map_data.grid_width == 0 or map_data.grid_height == 0: return
-
 	var w := map_data.grid_width; var h := map_data.grid_height
 	var img := Image.create(w, h, false, Image.FORMAT_RGBA8)
-
 	for tx in w:
 		for ty in h:
 			var td := map_data.get_tile(tx, ty)
@@ -431,59 +505,42 @@ func _update_minimap() -> void:
 			else:
 				avg_h = td.cubes[0].top_max()
 			var t := (avg_h - MD.MIN_H) / (MD.MAX_H - MD.MIN_H)
-			## Gradient : vert foncé (bas) → vert clair / blanc (haut)
-			var col := Color(t * 0.4 + 0.05, t * 0.60 + 0.15, t * 0.25 + 0.03, 1.0)
-			img.set_pixel(tx, ty, col)
-
-	## Surligner les tuiles sélectionnées
+			img.set_pixel(tx, ty, Color(t*0.4+0.05, t*0.60+0.15, t*0.25+0.03, 1.0))
 	var sel_color := Color(0.2, 0.65, 1.0, 1.0)
 	for cr in editor_3d.selected_corners:
-		var tx : int = cr["tx"]; var ty : int = cr["ty"]
-		if tx < w and ty < h: img.set_pixel(tx, ty, sel_color)
+		if cr["tx"] < w and cr["ty"] < h: img.set_pixel(cr["tx"], cr["ty"], sel_color)
 	for sf in editor_3d.selected_faces:
-		var tx : int = sf["tx"]; var ty : int = sf["ty"]
-		if tx < w and ty < h: img.set_pixel(tx, ty, sel_color)
-
+		if sf["tx"] < w and sf["ty"] < h: img.set_pixel(sf["tx"], sf["ty"], sel_color)
 	_minimap_rect.texture = ImageTexture.create_from_image(img)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HEIGHTMAP — IMPORT / EXPORT
+# HEIGHTMAP
 # ══════════════════════════════════════════════════════════════════════════════
 func _import_heightmap_dialog() -> void:
 	var dlg := FileDialog.new()
 	dlg.file_mode = FileDialog.FILE_MODE_OPEN_FILE
 	dlg.filters   = ["*.png, *.jpg, *.jpeg, *.bmp ; Images"]
 	dlg.access    = FileDialog.ACCESS_FILESYSTEM
-	add_child(dlg)
-	dlg.popup_centered(Vector2i(800, 600))
-	dlg.file_selected.connect(func(path: String):
-		_import_heightmap(path); dlg.queue_free())
+	add_child(dlg); dlg.popup_centered(Vector2i(800, 600))
+	dlg.file_selected.connect(func(path: String): _import_heightmap(path); dlg.queue_free())
 
 func _import_heightmap(path: String) -> void:
 	var img := Image.load_from_file(path)
-	if img == null:
-		_status_label.text = "✗ Impossible de charger : " + path.get_file(); return
+	if img == null: _status_label.text = "✗ Impossible de charger : " + path.get_file(); return
 	img.convert(Image.FORMAT_L8)
 	var iw := img.get_width(); var ih := img.get_height()
 	var w  := map_data.grid_width; var h := map_data.grid_height
-
 	for tx in w:
 		for ty in h:
-			var px := int(float(tx) / float(w) * iw)
-			var py := int(float(ty) / float(h) * ih)
-			px = clampi(px, 0, iw - 1); py = clampi(py, 0, ih - 1)
-			var gray : float = img.get_pixel(px, py).r
-			var height := MD.MIN_H + gray * (MD.MAX_H - MD.MIN_H)
-			height = snappedf(height, MD.HEIGHT_STEP)
-			var td := map_data.get_tile(tx, ty)
-			if td == null: continue
-			## On apply sur le(s) cube(s) de la tuile
+			var px := clampi(int(float(tx)/float(w)*iw), 0, iw-1)
+			var py := clampi(int(float(ty)/float(h)*ih), 0, ih-1)
+			var height := snappedf(MD.MIN_H + img.get_pixel(px,py).r*(MD.MAX_H-MD.MIN_H), MD.HEIGHT_STEP)
+			var td := map_data.get_tile(tx, ty); if td == null: continue
 			if td.subdivided:
 				for si in 4:
 					for ci in 4: td.cubes[si].corners[ci] = height
 			else:
 				for ci in 4: td.cubes[0].corners[ci] = height
-
 	editor_3d.build_all()
 	_status_label.text = "✓ Heightmap importée depuis : " + path.get_file()
 
@@ -492,10 +549,8 @@ func _export_heightmap_dialog() -> void:
 	dlg.file_mode = FileDialog.FILE_MODE_SAVE_FILE
 	dlg.filters   = ["*.png ; PNG Image"]
 	dlg.access    = FileDialog.ACCESS_FILESYSTEM
-	add_child(dlg)
-	dlg.popup_centered(Vector2i(800, 600))
-	dlg.file_selected.connect(func(path: String):
-		_export_heightmap(path); dlg.queue_free())
+	add_child(dlg); dlg.popup_centered(Vector2i(800, 600))
+	dlg.file_selected.connect(func(path: String): _export_heightmap(path); dlg.queue_free())
 
 func _export_heightmap(path: String) -> void:
 	var w := map_data.grid_width; var h := map_data.grid_height
@@ -503,36 +558,26 @@ func _export_heightmap(path: String) -> void:
 	var img := Image.create(w, h, false, Image.FORMAT_L8)
 	for tx in w:
 		for ty in h:
-			var td := map_data.get_tile(tx, ty)
-			var height : float = MD.MIN_H
+			var td := map_data.get_tile(tx, ty); var height := MD.MIN_H
 			if td:
 				if td.subdivided:
-					var mx : float = 0.0
-					for si in 4: mx = maxf(mx, td.cubes[si].top_max())
-					height = mx
-				else:
-					height = td.cubes[0].top_max()
-			var gray := clampf((height - MD.MIN_H) / (MD.MAX_H - MD.MIN_H), 0.0, 1.0)
-			img.set_pixel(tx, ty, Color(gray, gray, gray, 1.0))
-	var err := img.save_png(path)
-	if err == OK:
-		_status_label.text = "✓ Heightmap exportée : " + path.get_file()
-	else:
-		_status_label.text = "✗ Erreur d'export heightmap"
+					var mx := 0.0; for si in 4: mx = maxf(mx, td.cubes[si].top_max()); height = mx
+				else: height = td.cubes[0].top_max()
+			img.set_pixel(tx, ty, Color.from_hsv(0,0,clampf((height-MD.MIN_H)/(MD.MAX_H-MD.MIN_H),0,1)))
+	if img.save_png(path) == OK: _status_label.text = "✓ Heightmap exportée : " + path.get_file()
+	else: _status_label.text = "✗ Erreur d'export heightmap"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NAVIGATEUR TEXTURE
+# NAVIGATEUR TEXTURES
 # ══════════════════════════════════════════════════════════════════════════════
 func _on_import_atlas() -> void:
 	var dlg := FileDialog.new()
 	dlg.file_mode = FileDialog.FILE_MODE_OPEN_FILES
 	dlg.filters   = ["*.png, *.jpg, *.jpeg ; Images"]
 	dlg.access    = FileDialog.ACCESS_FILESYSTEM
-	add_child(dlg)
-	dlg.popup_centered(Vector2i(800, 600))
+	add_child(dlg); dlg.popup_centered(Vector2i(800, 600))
 	dlg.files_selected.connect(func(paths: PackedStringArray):
-		for p in paths: _load_atlas_file(p)
-		dlg.queue_free())
+		for p in paths: _load_atlas_file(p); dlg.queue_free())
 
 func _load_atlas_file(path: String) -> void:
 	var img := load(path) as Texture2D
@@ -543,11 +588,9 @@ func _load_atlas_file(path: String) -> void:
 	if img == null: return
 	for a in _loaded_atlases:
 		if a["path"] == path: return
-	_loaded_atlases.append({
-		"path": path, "texture": img,
-		"cols": maxi(1, img.get_width()  / _atlas_cell_size),
-		"rows": maxi(1, img.get_height() / _atlas_cell_size),
-	})
+	_loaded_atlases.append({"path": path, "texture": img,
+		"cols": maxi(1, img.get_width()/_atlas_cell_size),
+		"rows": maxi(1, img.get_height()/_atlas_cell_size)})
 	_refresh_texture_grid()
 
 func _scan_texture_folder() -> void:
@@ -563,24 +606,23 @@ func _scan_texture_folder() -> void:
 func _refresh_texture_grid() -> void:
 	for ch in _texture_grid_container.get_children(): ch.queue_free()
 	for atlas in _loaded_atlases:
-		var tex  : Texture2D = atlas["texture"]
-		var cols : int = maxi(1, tex.get_width()  / _atlas_cell_size)
-		var rows : int = maxi(1, tex.get_height() / _atlas_cell_size)
+		var tex : Texture2D = atlas["texture"]
+		var cols := maxi(1, tex.get_width()/_atlas_cell_size)
+		var rows := maxi(1, tex.get_height()/_atlas_cell_size)
 		atlas["cols"] = cols; atlas["rows"] = rows
 		for row in rows:
 			for col in cols:
-				var cell_btn := TextureButton.new()
-				cell_btn.custom_minimum_size = Vector2(44, 44)
-				cell_btn.stretch_mode = TextureButton.STRETCH_SCALE
+				var cb := TextureButton.new()
+				cb.custom_minimum_size = Vector2(44, 44)
+				cb.stretch_mode = TextureButton.STRETCH_SCALE
 				var at := AtlasTexture.new()
 				at.atlas  = tex
-				at.region = Rect2(col * _atlas_cell_size, row * _atlas_cell_size,
-								  _atlas_cell_size, _atlas_cell_size)
-				cell_btn.texture_normal = at
+				at.region = Rect2(col*_atlas_cell_size, row*_atlas_cell_size, _atlas_cell_size, _atlas_cell_size)
+				cb.texture_normal = at
 				var ap : String = atlas["path"]; var c : int = col; var r : int = row
-				cell_btn.pressed.connect(func(): _on_texture_cell_selected(ap, c, r))
-				cell_btn.tooltip_text = "%s [%d,%d]" % [ap.get_file(), col, row]
-				_texture_grid_container.add_child(cell_btn)
+				cb.pressed.connect(func(): _on_texture_cell_selected(ap, c, r))
+				cb.tooltip_text = "%s [%d,%d]" % [ap.get_file(), col, row]
+				_texture_grid_container.add_child(cb)
 
 func _on_texture_cell_selected(atlas_path: String, col: int, row: int) -> void:
 	_selected_atlas_path = atlas_path; _selected_atlas_col = col; _selected_atlas_row = row
@@ -591,8 +633,7 @@ func _on_texture_cell_selected(atlas_path: String, col: int, row: int) -> void:
 	editor_3d.set_pending_texture(fc)
 	var lbl := _side_bar.get_node_or_null("SelTexLbl") as Label
 	if lbl: lbl.text = "✓ " + atlas_path.get_file() + "\n[col %d, row %d]" % [col, row]
-	_status_label.text = "🖌 Texture active : %s [%d,%d] — Outil 🖌 pour peindre (drag pour étaler)" % [atlas_path.get_file(), col, row]
-	## Basculer automatiquement en outil Texture
+	_status_label.text = "🖌 Texture active : %s [%d,%d]" % [atlas_path.get_file(), col, row]
 	_select_tool_by_idx(2)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -614,23 +655,20 @@ func _build_new_map_dialog() -> Window:
 	var vbox := VBoxContainer.new(); vbox.add_theme_constant_override("separation", 12)
 	margin.add_child(vbox); win.add_child(margin)
 
-	var lbl := Label.new()
-	lbl.text = "Créer une nouvelle carte"
+	var lbl := Label.new(); lbl.text = "Créer une nouvelle carte"
 	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	lbl.add_theme_font_size_override("font_size", 16)
 	vbox.add_child(lbl)
 
 	var w_hbox := HBoxContainer.new()
 	w_hbox.add_child(_make_label("Largeur (X) :"))
-	var w_spin := SpinBox.new()
-	w_spin.min_value = 2; w_spin.max_value = 64; w_spin.value = 10
+	var w_spin := SpinBox.new(); w_spin.min_value = 2; w_spin.max_value = 64; w_spin.value = 10
 	w_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	w_hbox.add_child(w_spin); vbox.add_child(w_hbox)
 
 	var h_hbox := HBoxContainer.new()
 	h_hbox.add_child(_make_label("Hauteur (Z) :"))
-	var h_spin := SpinBox.new()
-	h_spin.min_value = 2; h_spin.max_value = 64; h_spin.value = 10
+	var h_spin := SpinBox.new(); h_spin.min_value = 2; h_spin.max_value = 64; h_spin.value = 10
 	h_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	h_hbox.add_child(h_spin); vbox.add_child(h_hbox)
 
@@ -646,8 +684,7 @@ func _build_new_map_dialog() -> Window:
 	btn_row.add_child(cancel)
 
 	var ok := Button.new(); ok.text = "✓  Créer"
-	ok.pressed.connect(func():
-		win.hide(); _create_new_map(int(w_spin.value), int(h_spin.value)))
+	ok.pressed.connect(func(): win.hide(); _create_new_map(int(w_spin.value), int(h_spin.value)))
 	btn_row.add_child(ok)
 
 	return win
@@ -656,13 +693,10 @@ func _create_new_map(w: int, h: int) -> void:
 	map_data.init_grid(w, h)
 	editor_3d.build_all()
 	_update_minimap()
-	_status_label.text = (
-		"✓ Carte %d×%d créée  |  Clic droit : orbiter  |  Molette : zoom" +
-		"  |  Clic gauche : sélectionner  |  Flèches : paner"
-	) % [w, h]
+	_status_label.text = "✓ Carte %d×%d créée  |  Clic droit : orbiter  |  Molette : zoom" % [w, h]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SUBDIVISION HELPERS
+# SUBDIVISION
 # ══════════════════════════════════════════════════════════════════════════════
 func _subdivide_selected() -> void:
 	var done := {}
@@ -672,8 +706,7 @@ func _subdivide_selected() -> void:
 	for sf in editor_3d.selected_faces:
 		var k := "%d,%d" % [sf["tx"], sf["ty"]]
 		if not done.has(k): done[k] = true; editor_3d.subdivide_tile(sf["tx"], sf["ty"])
-	if done.is_empty():
-		_status_label.text = "Sélectionnez d'abord une tuile (outil ⊕ ou ↕)."
+	if done.is_empty(): _status_label.text = "Sélectionnez d'abord une tuile."
 
 func _merge_selected() -> void:
 	var done := {}
@@ -683,39 +716,30 @@ func _merge_selected() -> void:
 	for sf in editor_3d.selected_faces:
 		var k := "%d,%d" % [sf["tx"], sf["ty"]]
 		if not done.has(k): done[k] = true; editor_3d.merge_tile(sf["tx"], sf["ty"])
-	if done.is_empty():
-		_status_label.text = "Sélectionnez d'abord une tuile (outil ⊕ ou ↕)."
+	if done.is_empty(): _status_label.text = "Sélectionnez d'abord une tuile."
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SAVE / LOAD
 # ══════════════════════════════════════════════════════════════════════════════
 func _save_map() -> void:
 	var dlg := FileDialog.new()
-	dlg.file_mode = FileDialog.FILE_MODE_SAVE_FILE
-	dlg.filters   = ["*.json ; Map JSON"]
-	dlg.access    = FileDialog.ACCESS_FILESYSTEM
-	add_child(dlg); dlg.popup_centered(Vector2i(800, 600))
+	dlg.file_mode = FileDialog.FILE_MODE_SAVE_FILE; dlg.filters = ["*.json ; Map JSON"]
+	dlg.access = FileDialog.ACCESS_FILESYSTEM; add_child(dlg); dlg.popup_centered(Vector2i(800, 600))
 	dlg.file_selected.connect(func(path: String):
 		var f := FileAccess.open(path, FileAccess.WRITE)
 		if f: f.store_string(map_data.to_json()); f.close()
-		_status_label.text = "✓ Carte sauvegardée : " + path.get_file()
-		dlg.queue_free())
+		_status_label.text = "✓ Carte sauvegardée : " + path.get_file(); dlg.queue_free())
 
 func _load_map() -> void:
 	var dlg := FileDialog.new()
-	dlg.file_mode = FileDialog.FILE_MODE_OPEN_FILE
-	dlg.filters   = ["*.json ; Map JSON"]
-	dlg.access    = FileDialog.ACCESS_FILESYSTEM
-	add_child(dlg); dlg.popup_centered(Vector2i(800, 600))
+	dlg.file_mode = FileDialog.FILE_MODE_OPEN_FILE; dlg.filters = ["*.json ; Map JSON"]
+	dlg.access = FileDialog.ACCESS_FILESYSTEM; add_child(dlg); dlg.popup_centered(Vector2i(800, 600))
 	dlg.file_selected.connect(func(path: String):
 		var f := FileAccess.open(path, FileAccess.READ)
 		if f:
 			var ok := map_data.from_json(f.get_as_text()); f.close()
-			if ok:
-				editor_3d.build_all(); _update_minimap()
-				_status_label.text = "✓ Carte chargée : " + path.get_file()
-			else:
-				_status_label.text = "✗ Erreur de lecture du fichier."
+			if ok: editor_3d.build_all(); _update_minimap()
+			_status_label.text = ("✓ Carte chargée : " if ok else "✗ Erreur : ") + path.get_file()
 		dlg.queue_free())
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -733,8 +757,8 @@ static func _add_btn(parent: Control, text: String, cb: Callable,
 	style.bg_color = color
 	style.corner_radius_top_left    = 4; style.corner_radius_top_right    = 4
 	style.corner_radius_bottom_left = 4; style.corner_radius_bottom_right = 4
-	style.content_margin_left  = 8; style.content_margin_right = 8
-	style.content_margin_top   = 4; style.content_margin_bottom = 4
+	style.content_margin_left = 8; style.content_margin_right = 8
+	style.content_margin_top  = 4; style.content_margin_bottom = 4
 	btn.add_theme_stylebox_override("normal", style)
 	btn.pressed.connect(cb)
 	parent.add_child(btn)
