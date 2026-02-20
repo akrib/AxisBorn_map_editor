@@ -1,7 +1,7 @@
 # Godot 4+ specific ignores
 .godot/
 .nomedia
-
+.png
 # Godot-specific ignores
 .import/
 export.cfg
@@ -30,7 +30,7 @@ mono_crash.*.json
 .export/
 .editor/
 godot.tmp/
-
+export/
 # OS-specific
 .DS_Store
 Thumbs.db

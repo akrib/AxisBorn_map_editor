@@ -1,7 +1,5 @@
-## editor_3d.gd  –  Version 2.2
-## Fix majeur : raycast utilise maintenant les coords viewport directement.
-## La taille du SubViewport est synchronisée avec le container via signal resized.
-## Des prints de debug sont inclus (cherchez [RAYCAST] et [CLICK] dans la console Godot).
+## editor_3d.gd  –  Version 3.0
+## Supports dual texture layers (base + overlay), trigger placement, tileset configs.
 extends Node
 
 const MD := preload("res://scripts/map_data.gd")
@@ -17,6 +15,7 @@ signal selection_changed
 signal status_message(msg: String)
 signal texture_picked(fc: MD.FaceConfig)
 signal map_changed
+signal trigger_placed(tx: int, ty: int, si: int, trigger: MD.TriggerData)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TOOL ENUM
@@ -27,6 +26,7 @@ enum Tool {
 	TEXTURE,        # 2
 	SINGLE_CORNER,  # 3
 	EYEDROPPER,     # 4
+	TRIGGER,        # 5
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -37,6 +37,10 @@ var current_tool   : int = Tool.SHARED_CORNER
 var selected_faces   : Array = []
 var selected_corners : Array = []
 var pending_texture  : MD.FaceConfig = null
+var pending_trigger_type : int = MD.TriggerType.NONE
+
+## Active texture layer: LAYER_BASE or LAYER_OVERLAY
+var active_layer : int = MD.LAYER_BASE
 
 var undo_redo    : UndoRedo
 var snap_enabled : bool = false
@@ -51,10 +55,14 @@ var _camera       : Camera3D
 var _cam_rig      : Node3D
 var _map_root     : Node3D
 var _cube_root    : Node3D
+var _overlay_root : Node3D   ## Overlay layer meshes
+var _trigger_root : Node3D   ## Trigger visual markers
 var _sel_root     : Node3D
 var _grid_root    : Node3D
 
-var _cube_nodes : Dictionary = {}
+var _cube_nodes    : Dictionary = {}
+var _overlay_nodes : Dictionary = {}
+var _trigger_nodes : Dictionary = {}
 
 # ── Caméra ───────────────────────────────────────────────────────────────────
 var _cam_distance  : float = 12.0
@@ -63,9 +71,7 @@ var _cam_azimuth   : float = 225.0
 var _is_orbiting   : bool  = false
 var _is_panning    : bool  = false
 
-# ── Container pour synchronisation de taille ─────────────────────────────────
 var _vp_container : Control = null
-
 var _physics_ready : bool = false
 
 # ── Hover visuals ────────────────────────────────────────────────────────────
@@ -87,11 +93,10 @@ func _ready() -> void:
 	await get_tree().process_frame
 	_physics_ready = true
 	_update_camera()
-	print("[E3D] _ready done — physics_ready=true, vp_size=", _sub_viewport.size)
 
 func _build_viewport() -> void:
 	_sub_viewport = SubViewport.new()
-	_sub_viewport.world_3d = World3D.new() 
+	_sub_viewport.world_3d = World3D.new()
 	_sub_viewport.size = Vector2i(1200, 800)
 	_sub_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
 	_sub_viewport.physics_object_picking      = true
@@ -122,17 +127,21 @@ func _build_viewport() -> void:
 	_camera = Camera3D.new(); _camera.name = "Camera"
 	_cam_rig.add_child(_camera)
 
-	_map_root  = Node3D.new(); _map_root.name  = "MapRoot"
-	_cube_root = Node3D.new(); _cube_root.name = "Cubes"
-	_sel_root  = Node3D.new(); _sel_root.name  = "Selection"
-	_grid_root = Node3D.new(); _grid_root.name = "Grid"
+	_map_root     = Node3D.new(); _map_root.name     = "MapRoot"
+	_cube_root    = Node3D.new(); _cube_root.name    = "Cubes"
+	_overlay_root = Node3D.new(); _overlay_root.name = "Overlays"
+	_trigger_root = Node3D.new(); _trigger_root.name = "Triggers"
+	_sel_root     = Node3D.new(); _sel_root.name     = "Selection"
+	_grid_root    = Node3D.new(); _grid_root.name    = "Grid"
 	_sub_viewport.add_child(_map_root)
 	_map_root.add_child(_cube_root)
+	_map_root.add_child(_overlay_root)
+	_map_root.add_child(_trigger_root)
 	_map_root.add_child(_sel_root)
 	_map_root.add_child(_grid_root)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SYNCHRONISATION TAILLE VIEWPORT ← CONTAINER
+# VIEWPORT SIZE SYNC
 # ══════════════════════════════════════════════════════════════════════════════
 func set_viewport_container(container: Control) -> void:
 	_vp_container = container
@@ -144,7 +153,6 @@ func _sync_viewport_size() -> void:
 	var s := Vector2i(int(_vp_container.size.x), int(_vp_container.size.y))
 	if s.x > 8 and s.y > 8 and _sub_viewport.size != s:
 		_sub_viewport.size = s
-		print("[E3D] Viewport resized → ", s)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BUILD MAP
@@ -154,6 +162,7 @@ func build_all() -> void:
 	for tx in map_data.grid_width:
 		for ty in map_data.grid_height:
 			_rebuild_tile(tx, ty)
+	_rebuild_all_triggers()
 	_build_grid_overlay()
 	_center_camera_on_map()
 	undo_redo.clear_history()
@@ -161,13 +170,17 @@ func build_all() -> void:
 
 func _clear_cube_nodes() -> void:
 	for child in _cube_root.get_children(): child.queue_free()
+	for child in _overlay_root.get_children(): child.queue_free()
+	for child in _trigger_root.get_children(): child.queue_free()
 	_cube_nodes.clear()
+	_overlay_nodes.clear()
+	_trigger_nodes.clear()
 	selected_corners.clear()
 	selected_faces.clear()
 	_clear_selection_nodes()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GRILLE
+# GRID
 # ══════════════════════════════════════════════════════════════════════════════
 func _build_grid_overlay() -> void:
 	for ch in _grid_root.get_children(): ch.queue_free()
@@ -200,7 +213,7 @@ func _add_grid_line(a: Vector3, b: Vector3, mat: Material) -> void:
 func toggle_grid(v: bool) -> void: _grid_root.visible = v
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TUILES
+# TILES
 # ══════════════════════════════════════════════════════════════════════════════
 func _rebuild_tile(tx: int, ty: int) -> void:
 	for si in [-1, 0, 1, 2, 3]:
@@ -208,6 +221,9 @@ func _rebuild_tile(tx: int, ty: int) -> void:
 		if _cube_nodes.has(key):
 			_cube_nodes[key]["mi"].queue_free()
 			_cube_nodes.erase(key)
+		if _overlay_nodes.has(key):
+			_overlay_nodes[key].queue_free()
+			_overlay_nodes.erase(key)
 	var td := map_data.get_tile(tx, ty)
 	if td == null: return
 	if not td.subdivided:
@@ -240,6 +256,16 @@ func _spawn_cube(tx: int, ty: int, si: int, cube: MD.CubeData, cube_size: float)
 	_cube_root.add_child(mi)
 	_cube_nodes[key] = {"mi": mi, "body": body}
 
+	# Spawn overlay mesh if it has overlay textures
+	if MB.has_overlay(cube):
+		var ov_mesh := MB.build_cube_overlay(cube, cube_size)
+		var ov_mi   := MeshInstance3D.new()
+		ov_mi.name = key + "_ov"
+		ov_mi.mesh = ov_mesh
+		ov_mi.position = _cube_world_pos(tx, ty, si, cube_size) + Vector3(0, 0.002, 0)
+		_overlay_root.add_child(ov_mi)
+		_overlay_nodes[key] = ov_mi
+
 static func _cube_world_pos(tx: int, ty: int, si: int, cube_size: float) -> Vector3:
 	var TS := MD.TILE_SIZE
 	var bx := float(tx) * TS
@@ -258,6 +284,8 @@ func rebuild_cube(tx: int, ty: int, si: int) -> void:
 	var cube_size := MD.TILE_SIZE if not td.subdivided else MD.TILE_SIZE * 0.5
 	var cube := td.cubes[0 if si < 0 else si]
 	var key  := _cube_key(tx, ty, si)
+
+	# Rebuild base mesh
 	if _cube_nodes.has(key):
 		var mi : MeshInstance3D = _cube_nodes[key]["mi"]
 		mi.mesh = MB.build_cube(cube, cube_size)
@@ -274,9 +302,88 @@ func rebuild_cube(tx: int, ty: int, si: int) -> void:
 		body.add_child(cshape)
 	else:
 		_spawn_cube(tx, ty, si, cube, cube_size)
+		return  # _spawn_cube handles overlay too
+
+	# Rebuild overlay mesh
+	if _overlay_nodes.has(key):
+		_overlay_nodes[key].queue_free()
+		_overlay_nodes.erase(key)
+	if MB.has_overlay(cube):
+		var ov_mesh := MB.build_cube_overlay(cube, cube_size)
+		var ov_mi   := MeshInstance3D.new()
+		ov_mi.name = key + "_ov"
+		ov_mi.mesh = ov_mesh
+		ov_mi.position = _cube_world_pos(tx, ty, si, cube_size) + Vector3(0, 0.002, 0)
+		_overlay_root.add_child(ov_mi)
+		_overlay_nodes[key] = ov_mi
+
+	# Rebuild trigger visual
+	_rebuild_trigger_visual(tx, ty, si)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CAMÉRA
+# TRIGGER VISUALS
+# ══════════════════════════════════════════════════════════════════════════════
+func _rebuild_all_triggers() -> void:
+	for ch in _trigger_root.get_children(): ch.queue_free()
+	_trigger_nodes.clear()
+	for tx in map_data.grid_width:
+		for ty in map_data.grid_height:
+			var td := map_data.get_tile(tx, ty)
+			if td == null: continue
+			if td.subdivided:
+				for si in 4:
+					_rebuild_trigger_visual(tx, ty, si)
+			else:
+				_rebuild_trigger_visual(tx, ty, -1)
+
+func _rebuild_trigger_visual(tx: int, ty: int, si: int) -> void:
+	var key := _cube_key(tx, ty, si)
+	if _trigger_nodes.has(key):
+		_trigger_nodes[key].queue_free()
+		_trigger_nodes.erase(key)
+
+	var cube := map_data.get_cube(tx, ty, si)
+	if cube == null or cube.trigger == null: return
+	if cube.trigger.type == MD.TriggerType.NONE: return
+
+	var td := map_data.get_tile(tx, ty)
+	var cs := MD.TILE_SIZE if (not td.subdivided) else MD.TILE_SIZE * 0.5
+	var pos := _cube_world_pos(tx, ty, si, cs)
+	var y := cube.top_max() + 0.15
+
+	# Create a billboard label with the trigger icon
+	var mi := MeshInstance3D.new()
+	mi.name = key + "_trig"
+	mi.position = pos + Vector3(0, y, 0)
+
+	var sphere := SphereMesh.new()
+	sphere.radius = 0.12
+	sphere.height = 0.24
+	mi.mesh = sphere
+
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.cull_mode    = BaseMaterial3D.CULL_DISABLED
+	# Color based on trigger type
+	match cube.trigger.type:
+		MD.TriggerType.SPAWN_POINT:    mat.albedo_color = Color(1.0, 0.3, 0.3)
+		MD.TriggerType.CHEST:          mat.albedo_color = Color(1.0, 0.85, 0.2)
+		MD.TriggerType.DOOR:           mat.albedo_color = Color(0.6, 0.4, 0.2)
+		MD.TriggerType.DRAWBRIDGE:     mat.albedo_color = Color(0.5, 0.5, 0.5)
+		MD.TriggerType.ANIMATION:      mat.albedo_color = Color(0.9, 0.5, 1.0)
+		MD.TriggerType.PARTICLES:      mat.albedo_color = Color(0.3, 1.0, 0.8)
+		MD.TriggerType.USABLE_OBJECT:  mat.albedo_color = Color(0.3, 0.7, 1.0)
+		MD.TriggerType.MESH_MARKER:    mat.albedo_color = Color(0.7, 0.7, 0.7)
+		_: mat.albedo_color = Color(1, 1, 1)
+	mi.set_surface_override_material(0, mat)
+	_trigger_root.add_child(mi)
+	_trigger_nodes[key] = mi
+
+func toggle_triggers_visible(v: bool) -> void:
+	_trigger_root.visible = v
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CAMERA
 # ══════════════════════════════════════════════════════════════════════════════
 func _center_camera_on_map() -> void:
 	var TS := MD.TILE_SIZE
@@ -385,11 +492,10 @@ func _on_mouse_motion(event: InputEventMouseMotion) -> void:
 			_do_tool_drag(event.position)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RAYCAST — avec prints de diagnostic
+# RAYCAST
 # ══════════════════════════════════════════════════════════════════════════════
 func _raycast(mouse_pos: Vector2) -> Dictionary:
 	if not _physics_ready or _camera == null:
-		print("[RAYCAST] Pas prêt : physics_ready=", _physics_ready, " camera=", _camera)
 		return {}
 
 	_sync_viewport_size()
@@ -401,30 +507,17 @@ func _raycast(mouse_pos: Vector2) -> Dictionary:
 		if ct.x > 0.0 and ct.y > 0.0 and vp_size.x > 0.0 and vp_size.y > 0.0:
 			final_pos = mouse_pos * vp_size / ct
 
-	print("[RAYCAST] mouse=", mouse_pos, " vp=", vp_size,
-		  " ct=", (_vp_container.size if _vp_container else Vector2.ZERO),
-		  " final=", final_pos)
-
 	var world := _sub_viewport.get_world_3d()
-	if world == null:
-		print("[RAYCAST] ERREUR : get_world_3d() retourne null")
-		return {}
+	if world == null: return {}
 	var space := world.get_direct_space_state()
-	if space == null:
-		print("[RAYCAST] ERREUR : get_direct_space_state() retourne null")
-		return {}
+	if space == null: return {}
 
 	var from := _camera.project_ray_origin(final_pos)
 	var dir  := _camera.project_ray_normal(final_pos)
-	print("[RAYCAST] ray from=", from.snappedf(0.01), " dir=", dir.snappedf(0.01))
 
 	var params := PhysicsRayQueryParameters3D.create(from, from + dir * 500.0)
 	params.collision_mask = 1
 	var result := space.intersect_ray(params)
-	if result.is_empty():
-		print("[RAYCAST] Aucune collision")
-	else:
-		print("[RAYCAST] HIT à ", result.get("position", Vector3.ZERO).snappedf(0.01))
 	return result
 
 func _hit_to_cube_info(hit: Dictionary) -> Dictionary:
@@ -496,6 +589,8 @@ func _do_tool_hover(mouse_pos: Vector2) -> void:
 			corner_hovered.emit([{"tx":tx,"ty":ty,"si":si,"ci":ci}])
 		Tool.FACE_HEIGHT, Tool.TEXTURE, Tool.EYEDROPPER:
 			_show_face_highlight(tx, ty, si, _hit_face_idx(info["normal"]), MB.hover_material())
+			cube_hovered.emit(tx, ty, si)
+		Tool.TRIGGER:
 			cube_hovered.emit(tx, ty, si)
 
 func _build_tile_outline_mesh(tx: int, ty: int, si: int,
@@ -579,17 +674,15 @@ func _clear_hover_visuals() -> void:
 		_hover_tile_outline.queue_free(); _hover_tile_outline = null
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OUTIL — CLIC (avec diagnostic)
+# TOOL — CLICK
 # ══════════════════════════════════════════════════════════════════════════════
 func _do_tool_click(mouse_pos: Vector2) -> void:
 	if not _physics_ready:
 		status_message.emit("Initialisation en cours…")
 		return
-	print("[CLICK] pos=", mouse_pos, " tool=", current_tool)
 	var hit  := _raycast(mouse_pos)
 	var info := _hit_to_cube_info(hit)
 	if info.is_empty():
-		print("[CLICK] Rien touché → déselection")
 		clear_selection(); return
 
 	var tx      := info["tx"] as int
@@ -597,7 +690,6 @@ func _do_tool_click(mouse_pos: Vector2) -> void:
 	var si      := info["si"] as int
 	var hit_pos := info["pos"] as Vector3
 	var normal  := info["normal"] as Vector3
-	print("[CLICK] Tuile (%d,%d) si=%d" % [tx, ty, si])
 
 	match current_tool:
 		Tool.SHARED_CORNER:
@@ -630,7 +722,7 @@ func _do_tool_click(mouse_pos: Vector2) -> void:
 		Tool.TEXTURE:
 			if pending_texture != null:
 				var fi  := _hit_face_idx(normal)
-				var key := "%s_%d" % [_cube_key(tx, ty, si), fi]
+				var key := "%s_%d_%d" % [_cube_key(tx, ty, si), fi, active_layer]
 				if not _drag_painted_keys.has(key):
 					_apply_texture_to_face(tx, ty, si, fi)
 					_drag_painted_keys[key] = true
@@ -641,13 +733,78 @@ func _do_tool_click(mouse_pos: Vector2) -> void:
 		Tool.EYEDROPPER:
 			var fi   := _hit_face_idx(normal)
 			var cube := map_data.get_cube(tx, ty, si)
-			if cube and cube.face_configs[fi].has_texture():
-				var fc : MD.FaceConfig = (cube.face_configs[fi] as MD.FaceConfig).dup()
-				pending_texture = fc
-				texture_picked.emit(fc)
-				status_message.emit("💧 Texture récupérée de (%d,%d) face %d" % [tx, ty, fi])
-			else:
-				status_message.emit("💧 Cette face n'a pas de texture")
+			if cube:
+				var fc : MD.FaceConfig = cube.get_face_config(fi, active_layer)
+				if fc.has_texture():
+					pending_texture = fc.dup()
+					texture_picked.emit(fc)
+					var layer_name := "overlay" if active_layer == MD.LAYER_OVERLAY else "base"
+					status_message.emit("💧 Texture récupérée (%s) de (%d,%d) face %d" % [layer_name, tx, ty, fi])
+				else:
+					status_message.emit("💧 Cette face n'a pas de texture sur cette couche")
+
+		Tool.TRIGGER:
+			_place_trigger(tx, ty, si)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRIGGER PLACEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+func _place_trigger(tx: int, ty: int, si: int) -> void:
+	if pending_trigger_type == MD.TriggerType.NONE:
+		# If clicking with NONE, remove existing trigger
+		var cube := map_data.get_cube(tx, ty, si)
+		if cube != null and cube.trigger != null and cube.trigger.type != MD.TriggerType.NONE:
+			cube.trigger = MD.TriggerData.new()
+			_rebuild_trigger_visual(tx, ty, si)
+			map_changed.emit()
+			status_message.emit("🗑 Trigger supprimé de (%d,%d)" % [tx, ty])
+		else:
+			status_message.emit("Sélectionnez un type de trigger dans le panneau")
+		return
+
+	var trigger := MD.TriggerData.new()
+	trigger.type = pending_trigger_type
+	trigger.id = "%s_%d_%d_%d" % [MD.TRIGGER_NAMES[pending_trigger_type].to_lower().replace(" ", "_"), tx, ty, si]
+
+	# Set default properties based on type
+	match pending_trigger_type:
+		MD.TriggerType.MESH_MARKER:
+			trigger.properties["mesh_path"] = ""
+			trigger.properties["rotation_y"] = 0.0
+			trigger.properties["scale"] = 1.0
+		MD.TriggerType.SPAWN_POINT:
+			trigger.properties["entity_type"] = "default"
+			trigger.properties["count"] = 1
+		MD.TriggerType.CHEST:
+			trigger.properties["locked"] = false
+			trigger.properties["key_id"] = ""
+			trigger.properties["loot_table"] = ""
+		MD.TriggerType.DOOR:
+			trigger.properties["locked"] = false
+			trigger.properties["key_id"] = ""
+			trigger.properties["destination"] = ""
+		MD.TriggerType.DRAWBRIDGE:
+			trigger.properties["raised"] = true
+			trigger.properties["trigger_id"] = ""
+		MD.TriggerType.ANIMATION:
+			trigger.properties["anim_name"] = ""
+			trigger.properties["loop"] = false
+		MD.TriggerType.PARTICLES:
+			trigger.properties["effect_name"] = ""
+			trigger.properties["color"] = "#ffffff"
+		MD.TriggerType.USABLE_OBJECT:
+			trigger.properties["action"] = ""
+			trigger.properties["item_id"] = ""
+
+	map_data.set_trigger(tx, ty, si, trigger)
+	_rebuild_trigger_visual(tx, ty, si)
+	map_changed.emit()
+	trigger_placed.emit(tx, ty, si, trigger)
+	var icon : String = MD.TRIGGER_ICONS.get(pending_trigger_type, "")
+	status_message.emit("%s Trigger '%s' placé sur (%d,%d)" % [icon, MD.TRIGGER_NAMES[pending_trigger_type], tx, ty])
+
+func set_pending_trigger(type: int) -> void:
+	pending_trigger_type = type
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DRAG
@@ -664,7 +821,7 @@ func _do_tool_drag(mouse_pos: Vector2) -> void:
 		Tool.TEXTURE:
 			if pending_texture != null:
 				var fi  := _hit_face_idx(info["normal"])
-				var key := "%s_%d" % [_cube_key(tx, ty, si), fi]
+				var key := "%s_%d_%d" % [_cube_key(tx, ty, si), fi, active_layer]
 				if not _drag_painted_keys.has(key):
 					_apply_texture_to_face(tx, ty, si, fi)
 					_drag_painted_keys[key] = true
@@ -672,13 +829,14 @@ func _do_tool_drag(mouse_pos: Vector2) -> void:
 func _apply_texture_to_face(tx: int, ty: int, si: int, fi: int) -> void:
 	var cube := map_data.get_cube(tx, ty, si)
 	if cube == null or pending_texture == null: return
-	cube.face_configs[fi] = pending_texture.dup()
+	cube.set_face_config(fi, active_layer, pending_texture.dup())
 	rebuild_cube(tx, ty, si)
 	map_changed.emit()
-	status_message.emit("🖌 Texture appliquée sur (%d,%d) face %d" % [tx, ty, fi])
+	var layer_name := "overlay" if active_layer == MD.LAYER_OVERLAY else "base"
+	status_message.emit("🖌 Texture appliquée (%s) sur (%d,%d) face %d" % [layer_name, tx, ty, fi])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HAUTEUR
+# HEIGHT
 # ══════════════════════════════════════════════════════════════════════════════
 func adjust_height(delta: float) -> void:
 	if not selected_corners.is_empty():
@@ -787,7 +945,7 @@ func redo() -> void:
 		status_message.emit("Rien à rétablir")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COPIER / COLLER
+# COPY / PASTE
 # ══════════════════════════════════════════════════════════════════════════════
 func copy_selected() -> void:
 	var cube : MD.CubeData = null
@@ -817,13 +975,17 @@ func paste_selected() -> void:
 		var cube := map_data.get_cube(t["tx"], t["ty"], t["si"])
 		if cube == null: continue
 		cube.corners = _clipboard_cube.corners.duplicate()
-		for fi in 6: cube.face_configs[fi] = _clipboard_cube.face_configs[fi].dup()
+		for fi in 6:
+			cube.face_configs[fi] = _clipboard_cube.face_configs[fi].dup()
+			cube.overlay_configs[fi] = _clipboard_cube.overlay_configs[fi].dup()
+		if _clipboard_cube.trigger != null:
+			cube.trigger = _clipboard_cube.trigger.dup()
 		_rebuild_tile(t["tx"], t["ty"])
 	map_changed.emit()
 	status_message.emit("✓ Collé sur %d zone(s)" % targets.size())
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OVERLAY SÉLECTION
+# SELECTION OVERLAY
 # ══════════════════════════════════════════════════════════════════════════════
 func _clear_selection_nodes() -> void:
 	for ch in _sel_root.get_children(): ch.queue_free()
@@ -886,7 +1048,7 @@ func clear_selection() -> void:
 	_clear_selection_nodes(); selection_changed.emit()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SUBDIVISION / FUSION
+# SUBDIVISION / MERGE
 # ══════════════════════════════════════════════════════════════════════════════
 func subdivide_tile(tx: int, ty: int) -> void:
 	var td := map_data.get_tile(tx, ty)
@@ -899,11 +1061,13 @@ func merge_tile(tx: int, ty: int) -> void:
 	td.merge(); _rebuild_tile(tx, ty); clear_selection(); map_changed.emit()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODE TEST
+# TEST MODE
 # ══════════════════════════════════════════════════════════════════════════════
 func toggle_test_mode(enabled: bool) -> void:
-	_cube_root.visible = not enabled
-	_grid_root.visible = not enabled
+	_cube_root.visible    = not enabled
+	_overlay_root.visible = not enabled
+	_grid_root.visible    = not enabled
+	_trigger_root.visible = not enabled
 
 func export_to_json_map() -> Dictionary:
 	var jm := {"width": map_data.grid_width, "height": map_data.grid_height, "tiles": []}
@@ -917,7 +1081,18 @@ func export_to_json_map() -> Dictionary:
 	return jm
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ACCESSEURS
+# LAYER
+# ══════════════════════════════════════════════════════════════════════════════
+func set_active_layer(layer: int) -> void:
+	active_layer = layer
+	var name := "Overlay (haute)" if layer == MD.LAYER_OVERLAY else "Base (basse)"
+	status_message.emit("Couche active : %s" % name)
+
+func get_active_layer() -> int:
+	return active_layer
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ACCESSORS
 # ══════════════════════════════════════════════════════════════════════════════
 func get_sub_viewport() -> SubViewport: return _sub_viewport
 func set_tool(t: int) -> void: current_tool = t; clear_selection()

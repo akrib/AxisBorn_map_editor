@@ -1,12 +1,12 @@
 ## mesh_builder.gd
 ## Builds ArrayMesh for a single CubeData.
 ## Each face is a separate surface → one material per face.
-## FIX : AtlasTexture ne fonctionne pas correctement en 3D (Godot 4).
-##       On utilise la texture complète + uv1_offset / uv1_scale pour isoler la cellule.
+## Now supports dual layers: base + overlay (transparent) per face.
+## Supports tileset configs with x_start, y_start, x_spacing, y_spacing.
 class_name MeshBuilder
 extends RefCounted
 
-## Material cache: "path|col|row|cs|uvs" → StandardMaterial3D
+## Material cache: "path|col|row|cs|uvs|xs|ys|xsp|ysp" → StandardMaterial3D
 static var _mat_cache     : Dictionary = {}
 static var _default_top   : StandardMaterial3D = null
 static var _default_side  : StandardMaterial3D = null
@@ -18,40 +18,52 @@ static func clear_cache() -> void:
 	_default_top  = null
 	_default_side = null
 
-## Build an ArrayMesh for a CubeData.
-## cube_size = TILE_SIZE for full tiles, TILE_SIZE/2 for sub-tiles.
+## Build an ArrayMesh for a CubeData (base layer only).
 static func build_cube(
 	cube     : MapData.CubeData,
 	cube_size: float,
 	tile_type: int = 0
 ) -> ArrayMesh:
+	return _build_cube_layer(cube, cube_size, MapData.LAYER_BASE)
+
+## Build an ArrayMesh for the overlay layer of a CubeData.
+static func build_cube_overlay(
+	cube     : MapData.CubeData,
+	cube_size: float
+) -> ArrayMesh:
+	return _build_cube_layer(cube, cube_size, MapData.LAYER_OVERLAY)
+
+## Check if a cube has any overlay textures
+static func has_overlay(cube: MapData.CubeData) -> bool:
+	for i in 6:
+		if cube.overlay_configs[i].has_texture():
+			return true
+	return false
+
+static func _build_cube_layer(
+	cube     : MapData.CubeData,
+	cube_size: float,
+	layer    : int
+) -> ArrayMesh:
 	var hx := cube_size * 0.5
 	var hz := cube_size * 0.5
 	var by := cube.base_y
 
-	# Top corners (absolute Y)
 	var tnw := Vector3(-hx, cube.corners[MapData.CORNER_NW], -hz)
 	var tne := Vector3( hx, cube.corners[MapData.CORNER_NE], -hz)
 	var tse := Vector3( hx, cube.corners[MapData.CORNER_SE],  hz)
 	var tsw := Vector3(-hx, cube.corners[MapData.CORNER_SW],  hz)
-	# Base corners
 	var bnw := Vector3(-hx, by, -hz)
 	var bne := Vector3( hx, by, -hz)
 	var bse := Vector3( hx, by,  hz)
 	var bsw := Vector3(-hx, by,  hz)
 
 	var face_quads := [
-		# TOP
 		[tnw, tne, tse, tsw,  Vector3(0, 1, 0),   MapData.FACE_TOP],
-		# NORTH Z-
 		[tne, tnw, bnw, bne,  Vector3(0, 0,-1),   MapData.FACE_NORTH],
-		# SOUTH Z+
 		[tsw, tse, bse, bsw,  Vector3(0, 0, 1),   MapData.FACE_SOUTH],
-		# WEST X-
 		[tnw, tsw, bsw, bnw,  Vector3(-1, 0, 0),  MapData.FACE_WEST],
-		# EAST X+
 		[tse, tne, bne, bse,  Vector3( 1, 0, 0),  MapData.FACE_EAST],
-		# BOTTOM
 		[bnw, bne, bse, bsw,  Vector3(0,-1, 0),   MapData.FACE_BOTTOM],
 	]
 
@@ -60,9 +72,13 @@ static func build_cube(
 		var v0 : Vector3 = fq[0]; var v1 : Vector3 = fq[1]
 		var v2 : Vector3 = fq[2]; var v3 : Vector3 = fq[3]
 		var n  : Vector3 = fq[4]; var fi  : int     = fq[5]
-		var fc : MapData.FaceConfig = cube.face_configs[fi]
 
-		# Smooth normals on top face if corners differ
+		var fc : MapData.FaceConfig
+		if layer == MapData.LAYER_OVERLAY:
+			fc = cube.overlay_configs[fi]
+		else:
+			fc = cube.face_configs[fi]
+
 		var n0 := n; var n1 := n; var n2 := n; var n3 := n
 		if fi == MapData.FACE_TOP and not _corners_flat(cube.corners):
 			n0 = _smooth_n(v0, v1, v3)
@@ -73,12 +89,20 @@ static func build_cube(
 		var arr := []; arr.resize(Mesh.ARRAY_MAX)
 		arr[Mesh.ARRAY_VERTEX] = PackedVector3Array([v0, v1, v2, v3])
 		arr[Mesh.ARRAY_NORMAL] = PackedVector3Array([n0, n1, n2, n3])
-		# UVs toujours 0→1 ; c'est uv1_offset/uv1_scale du matériau qui isole la cellule
 		arr[Mesh.ARRAY_TEX_UV] = PackedVector2Array([
 			Vector2(0,0), Vector2(1,0), Vector2(1,1), Vector2(0,1)])
 		arr[Mesh.ARRAY_INDEX]  = PackedInt32Array([0, 1, 2,  0, 2, 3])
 		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
-		mesh.surface_set_material(fi, _get_mat(fc, fi == MapData.FACE_TOP))
+
+		var mat : StandardMaterial3D
+		if layer == MapData.LAYER_OVERLAY:
+			if fc.has_texture():
+				mat = _get_mat(fc, fi == MapData.FACE_TOP, true)
+			else:
+				mat = _invisible_mat()
+		else:
+			mat = _get_mat(fc, fi == MapData.FACE_TOP, false)
+		mesh.surface_set_material(fi, mat)
 
 	return mesh
 
@@ -90,21 +114,14 @@ static func _smooth_n(v: Vector3, a: Vector3, b: Vector3) -> Vector3:
 	var n := (a - v).cross(b - v).normalized()
 	return n if n.y >= 0.0 else -n
 
-# ── Matériau ──────────────────────────────────────────────────────────────────
-# On NE PAS utiliser AtlasTexture en 3D : Godot 4 ne remaphe pas les UV UV→région.
-# À la place : texture complète + uv1_offset/uv1_scale calculés depuis la cellule.
-#
-#   uv1_offset = (col * cell_size / tex_w ,  row * cell_size / tex_h)
-#   uv1_scale  = (cell_size / tex_w * uv_scale ,  cell_size / tex_h * uv_scale)
-#
-# Avec des UVs mesh de 0 à 1 :
-#   UV final = UV_mesh * uv1_scale + uv1_offset
-#   → à UV=0 : début de la cellule  ✓
-#   → à UV=1 : fin de la cellule (×uv_scale pour la répétition)  ✓
-static func _get_mat(fc: MapData.FaceConfig, is_top: bool) -> StandardMaterial3D:
+# ── Matériau avec support tileset spacing ─────────────────────────────────────
+static func _get_mat(fc: MapData.FaceConfig, is_top: bool, is_overlay: bool = false) -> StandardMaterial3D:
 	if fc.has_texture():
-		var key := "%s|%d|%d|%d|%.3f" % [
-			fc.atlas_path, fc.atlas_col, fc.atlas_row, fc.cell_size, fc.uv_scale]
+		var key := "%s|%d|%d|%d|%.3f|%d|%d|%d|%d|%s" % [
+			fc.atlas_path, fc.atlas_col, fc.atlas_row, fc.cell_size, fc.uv_scale,
+			fc.tileset_x_start, fc.tileset_y_start,
+			fc.tileset_x_spacing, fc.tileset_y_spacing,
+			"ov" if is_overlay else "base"]
 		if _mat_cache.has(key):
 			return _mat_cache[key]
 
@@ -114,10 +131,12 @@ static func _get_mat(fc: MapData.FaceConfig, is_top: bool) -> StandardMaterial3D
 			var th  := float(atlas_tex.get_height())
 			var cs  := float(fc.cell_size)
 
-			# Offset = coin haut-gauche de la cellule en coordonnées 0-1
-			var u_off := (float(fc.atlas_col) * cs) / tw
-			var v_off := (float(fc.atlas_row) * cs) / th
-			# Scale = taille d'une cellule en coordonnées 0-1, multipliée par uv_scale
+			# Compute pixel position using tileset offsets and spacing
+			var px := float(fc.tileset_x_start) + float(fc.atlas_col) * (cs + float(fc.tileset_x_spacing))
+			var py := float(fc.tileset_y_start) + float(fc.atlas_row) * (cs + float(fc.tileset_y_spacing))
+
+			var u_off := px / tw
+			var v_off := py / th
 			var u_scl := (cs / tw) * fc.uv_scale
 			var v_scl := (cs / th) * fc.uv_scale
 
@@ -128,10 +147,23 @@ static func _get_mat(fc: MapData.FaceConfig, is_top: bool) -> StandardMaterial3D
 			mat.uv1_scale      = Vector3(u_scl, v_scl, 1.0)
 			mat.cull_mode      = BaseMaterial3D.CULL_DISABLED
 			mat.roughness      = 0.9
-			_mat_cache[key]    = mat
+
+			if is_overlay:
+				mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+				mat.render_priority = 1  ## Draw on top
+
+			_mat_cache[key] = mat
 			return mat
 
+	if is_overlay:
+		return _invisible_mat()
 	return _default_mat(is_top)
+
+static func _invisible_mat() -> StandardMaterial3D:
+	var mat := StandardMaterial3D.new()
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.albedo_color = Color(0, 0, 0, 0)
+	return mat
 
 static func _default_mat(is_top: bool) -> StandardMaterial3D:
 	if is_top:
